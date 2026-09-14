@@ -28,12 +28,15 @@ PROG="/mnt/data_mmcblk0p27/lan-share/lan-share"
 LISTEN="0.0.0.0:18080"
 
 start_service() {
-    mkdir -p "$ROOT/data" "$ROOT/files/permanent" "$ROOT/files/temporary" "$ROOT/files/chat" "$ROOT/logs"
+    mkdir -p "$ROOT/data" "$ROOT/files/permanent" "$ROOT/files/temporary" "$ROOT/files/chat" "$ROOT/logs" "$ROOT/tmp"
 
     procd_open_instance
     procd_set_param command "$PROG"
     procd_set_param env LANSHARE_ROOT="$ROOT"
     procd_set_param env LANSHARE_LISTEN="$LISTEN"
+    # TMPDIR 必须指到数据分区：OpenWrt 的 /tmp 是 tmpfs（内存），
+    # 临时文件落在那里会让大文件上传直接吃满 RAM 并触发 OOM。
+    procd_set_param env TMPDIR="$ROOT/tmp"
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1

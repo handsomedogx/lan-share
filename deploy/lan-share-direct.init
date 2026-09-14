@@ -63,17 +63,25 @@ start_service() {
 	fi
 
 	# 首次运行自动补建数据目录，免得用户手动 mkdir。
+	# tmp 目录给 Go 的 os.CreateTemp 用（见下面 TMPDIR 的说明）。
 	mkdir -p "$PROG_DIR/data" "$PROG_DIR/files/permanent" \
 	         "$PROG_DIR/files/temporary" "$PROG_DIR/files/chat" \
-	         "$PROG_DIR/logs"
+	         "$PROG_DIR/logs" "$PROG_DIR/tmp"
 
 	procd_open_instance
 	procd_set_param command "$PROG"
 
 	# 环境变量：显式指定各路径，避免依赖默认值。
+	#
+	# TMPDIR 这条不是可选项：OpenWrt 的 /tmp 是 tmpfs，也就是内存。
+	# Go 标准库（multipart、os.CreateTemp）默认往 TMPDIR 落临时文件，
+	# 于是上传一个 100MB 的文件就等于吃掉 100MB 内存 —— 曾因此在
+	# 传 125MB 文件时被内核 OOM Killer 直接杀掉。指到数据分区后，
+	# 临时文件才是真正写在 ext4 上，不占 RAM。
 	procd_set_param env \
 		LANSHARE_ROOT="$PROG_DIR" \
-		LANSHARE_LISTEN="$LISTEN_ADDR"
+		LANSHARE_LISTEN="$LISTEN_ADDR" \
+		TMPDIR="$PROG_DIR/tmp"
 
 	# 异常退出自动重启；限流避免「启动即崩溃」时疯狂重启拖垮路由器。
 	procd_set_param respawn 3600 5 5

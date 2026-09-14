@@ -32,6 +32,15 @@ type Config struct {
 	// LogPath 是日志文件路径，会做大小限制防止无限增长。
 	LogPath string
 
+	// TmpDir 是临时文件目录，会写进进程自身的 TMPDIR 环境变量。
+	//
+	// 为什么程序要自己管这件事：OpenWrt 的 /tmp 是 tmpfs —— 它占的是内存。
+	// 标准库（os.CreateTemp、multipart）默认就往 TMPDIR 落临时文件，
+	// 于是「传一个 100MB 的文件」≈「吃掉 100MB 内存」，曾直接触发 OOM Killer。
+	// 部署脚本也会设 TMPDIR（见 deploy/*.init），这里只是给「手工跑二进制」
+	// 的场景兜底，保证不管怎么启动都写数据分区。
+	TmpDir string
+
 	// SessionTTL 是会话 Cookie 的有效期（秒）。
 	SessionTTL int
 
@@ -90,6 +99,7 @@ func Load() (*Config, error) {
 		DatabasePath:       env("LANSHARE_DB", filepath.Join(root, "data", "lan-share.db")),
 		FilesRoot:          env("LANSHARE_FILES", filepath.Join(root, "files")),
 		LogPath:            env("LANSHARE_LOG", filepath.Join(root, "logs", "lan-share.log")),
+		TmpDir:             env("TMPDIR", filepath.Join(root, "tmp")),
 		SessionTTL:         30 * 24 * 3600,       // 30 天
 		TempFileDefaultTTL: 6 * 3600,             // 6 小时
 		ChatMaxUploadBytes: DefaultChatMaxUpload, // 100 MB
@@ -129,11 +139,20 @@ func (c *Config) EnsureDirs() error {
 		filepath.Join(c.FilesRoot, "temporary"),
 		filepath.Join(c.FilesRoot, "chat"),
 		filepath.Dir(c.LogPath),
+		c.TmpDir,
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("创建目录 %s 失败: %w", d, err)
 		}
+	}
+
+	// 把 TMPDIR 指回数据分区。必须在任何临时文件产生之前执行 ——
+	// os.TempDir() 每次调用都重新读这个环境变量，所以在这里设是有效的。
+	//
+	// 若外部（procd）已经设过，这里设的是同一个值，无副作用。
+	if err := os.Setenv("TMPDIR", c.TmpDir); err != nil {
+		return fmt.Errorf("设置 TMPDIR 失败: %w", err)
 	}
 	return nil
 }
