@@ -500,6 +500,8 @@ logread | grep lan-share
 | `LANSHARE_LOG` | `<ROOT>/logs/lan-share.log` | 日志路径 |
 | `LANSHARE_MAX_UPLOAD_MB` | `0`（不限） | 仓库单文件上传上限 |
 | `LANSHARE_CHAT_UPLOAD_MB` | `100` | **聊天室单文件上限**；不设则回落到 `LANSHARE_MAX_UPLOAD_MB` |
+| `LANSHARE_UPLOAD_CONCURRENCY` | `2` | 服务端同时处理的上传数；`0` 表示不限 |
+| `TMPDIR` | `<ROOT>/tmp` | 临时文件目录。**不要指向 `/tmp`**（OpenWrt 上是 tmpfs＝内存，大文件会 OOM）。程序启动时若未设置会自动设成 `<ROOT>/tmp` |
 
 命令行参数：
 
@@ -608,6 +610,16 @@ logread | grep lan-share
 **大文件上传失败？**
 先看程序侧 `LANSHARE_MAX_UPLOAD_MB`，再确认 nginx 的 `client_max_body_size`
 不小于它。
+
+**上传进度到 100% 后还停一会儿？**
+这是正常的：浏览器发完请求体之后，服务端还要 fsync + rename + 写库。
+界面会显示「保存中…」。若这段停顿特别长，看日志里的 `speed=` ——
+千兆局域网理论约 110MB/s，实测低一个数量级就该去查 Wi-Fi 或磁盘写入，
+而不是先怀疑程序。
+
+**上传被拒（507 磁盘空间不足）？**
+程序会预先查一次剩余空间并预留 5%，避免传到一半才失败。
+清理文件仓库后重试即可。
 
 **想直接本地调试？**
 
