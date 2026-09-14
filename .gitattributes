@@ -1,0 +1,13 @@
+# 源码统一用 LF 换行：仓库里存 LF，工作区检出也保持 LF。
+#
+# 这一条对 deploy/*.init 与 scripts/*.sh 尤其重要 —— 它们是 OpenWrt 上的
+# busybox ash 脚本，一旦被 Windows 检出成 CRLF，解释器会把 \r 当成命令的一部分，
+# 报出诸如 "shift: shift count out of range" 这种看起来毫不相干的错。
+* text=auto eol=lf
+
+# 二进制文件不做任何换行转换
+*.zip  binary
+*.exe  binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
