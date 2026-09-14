@@ -1307,6 +1307,38 @@ function pickFiles() {
   $('#fileInput').click();
 }
 
+/**
+ * 同时上传的文件数。
+ *
+ * 选 2 是给路由器定的：同时跑 10 个「收网络 + 写磁盘 + 算 SHA256 + fsync」
+ * 会明显抬高负载，而 1～2 路基本已经能把千兆内网的磁盘吃满。
+ * 服务端另有同值的信号量兜底（LANSHARE_UPLOAD_CONCURRENCY），
+ * 防止开多个浏览器绕过这里的排队。
+ */
+const UPLOAD_CONCURRENCY = 2;
+
+/**
+ * 跑一批任务，同时在飞的最多 concurrency 个，完成一个补一个。
+ *
+ * tasks 里的每一项都是「拿到控制权后才执行」的函数 ——
+ * 这样剩下的一直留在数组里等着，不会被提前创建出 XHR 连接。
+ */
+function runWithConcurrency(tasks, concurrency) {
+  let i = 0;
+  const n = Math.min(concurrency, tasks.length);
+
+  const next = () => {
+    if (i >= tasks.length) return;
+    const task = tasks[i++];
+    // 用 Promise.resolve().then(task) 而不是直接 task()：
+    // 这样任务里万一同步抛异常也会被 then 的第二个回调接住，
+    // 队列不会因为一个坏任务就停摆。
+    Promise.resolve().then(task).then(next, next);
+  };
+
+  for (let k = 0; k < n; k++) next();
+}
+
 /** 上传一批文件。 */
 function uploadFiles(fileList) {
   const list = Array.from(fileList || []);
@@ -1321,11 +1353,18 @@ function uploadFiles(fileList) {
   const box = $('#uploadList');
   box.hidden = false;
 
-  list.forEach((file) => uploadOne(file, box));
+  // 先给每个文件建好进度条（显示「等待中」），再交给队列跑。
+  // 这样用户一眼能看到总量，也知道哪些还没轮到，而不是以为漏掉了。
+  const jobs = list.map((file) => {
+    const row = makeUploadRow(file, box);
+    setText(row.pct, '等待中');
+    return () => uploadOne(file, row);
+  });
+  runWithConcurrency(jobs, UPLOAD_CONCURRENCY);
 }
 
-/** 上传单个文件，用 XMLHttpRequest 以获得真实上传进度。 */
-function uploadOne(file, box) {
+/** 建一条上传进度条，返回它的几个可更新节点。 */
+function makeUploadRow(file, box) {
   const row = document.createElement('div');
   row.className = 'up-item';
   row.innerHTML = '<div class="up-line">'
@@ -1334,8 +1373,21 @@ function uploadOne(file, box) {
   setText($('.up-name', row), file.name);
   box.appendChild(row);
 
-  const fill = $('.up-fill', row);
-  const pct = $('.up-pct', row);
+  return { row, fill: $('.up-fill', row), pct: $('.up-pct', row) };
+}
+
+/**
+ * 上传单个文件，用 XMLHttpRequest 以获得真实上传进度。
+ *
+ * 返回的 Promise 在请求彻底结束（成功 / 失败 / 中断）时才 resolve，
+ * 供上传队列判断何时放行下一个。
+ */
+function uploadOne(file, ui) {
+  const { row, fill, pct } = ui;
+  const box = row.parentElement;
+
+  let markDone;
+  const finished = new Promise((r) => { markDone = r; });
 
   const form = new FormData();
   // 顺序有讲究：必须先把 kind / name 放进 FormData，再放文件。
@@ -1403,7 +1455,12 @@ function uploadOne(file, box) {
     }, 3200);
   });
 
+  // loadend 在 load / error / abort / timeout 之后都会触发，
+  // 用它收口最稳 —— 任何一个分支漏掉都会让队列永久卡住一个位置。
+  xhr.addEventListener('loadend', () => markDone());
+
   xhr.send(form);
+  return finished;
 }
 
 /* ------------------------------------------------------------------ 7b. 聊天室文件 */
@@ -1435,21 +1492,23 @@ function sendFilesToRoom(fileList) {
 
   const box = $('#chatUploadList');
   box.hidden = false;
-  list.forEach((file) => sendOneChatFile(file, box));
+
+  // 与文件仓库同样限量并发：聊天室传的也常常是几百 MB 的安装包。
+  const jobs = list.map((file) => {
+    const ui = makeUploadRow(file, box);
+    setText(ui.pct, '等待中');
+    return () => sendOneChatFile(file, ui);
+  });
+  runWithConcurrency(jobs, UPLOAD_CONCURRENCY);
 }
 
 /** 上传单个聊天文件并广播卡片。 */
-function sendOneChatFile(file, box) {
-  const row = document.createElement('div');
-  row.className = 'up-item';
-  row.innerHTML = '<div class="up-line">'
-    + '<span class="up-name"></span><span class="up-pct">0%</span>'
-    + '</div><div class="up-bar"><div class="up-fill"></div></div>';
-  setText($('.up-name', row), file.name);
-  box.appendChild(row);
+function sendOneChatFile(file, ui) {
+  const { row, fill, pct } = ui;
+  const box = row.parentElement;
 
-  const fill = $('.up-fill', row);
-  const pct = $('.up-pct', row);
+  let markDone;
+  const finished = new Promise((r) => { markDone = r; });
 
   const finish = (delay) => {
     setTimeout(() => {
@@ -1531,7 +1590,10 @@ function sendOneChatFile(file, box) {
     finish(3200);
   });
 
+  xhr.addEventListener('loadend', () => markDone());
+
   xhr.send(form);
+  return finished;
 }
 
 /* ------------------------------------------------------------------ 8. 绑定与初始化 */
