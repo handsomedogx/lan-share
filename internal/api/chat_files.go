@@ -53,6 +53,14 @@ func (s *Server) handleChatUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.files.HasRoomForUpload(r.ContentLength); err != nil {
+		if errors.Is(err, files.ErrNoSpace) {
+			s.log.Error("聊天文件上传前磁盘空间检查未通过: %v", err)
+			httpx.Fail(w, http.StatusInsufficientStorage, "磁盘空间不足，无法发送文件")
+			return
+		}
+	}
+
 	// 与文件仓库共用一个上传名额池：两条链路抢的是同一块磁盘和 CPU，
 	// 分开限流等于没限。
 	if err := s.acquireUploadSlot(r.Context()); err != nil {

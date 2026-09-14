@@ -102,6 +102,18 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 // 服务端是流式解析，遇到 file part 就立刻开始落盘，
 // 之后出现的字段已经读不到了（详见 upload.go 里 uploadStream 的注释）。
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	// 磁盘空间先查一次。ContentLength 是含 multipart 封装的总请求体，
+	// 比文件本身略大，拿它当「至少要用多少」来判正合适（宁可保守）。
+	//
+	// 放在拿名额之前：空间不够就没必要排队了，直接拒绝。
+	if err := s.files.HasRoomForUpload(r.ContentLength); err != nil {
+		if errors.Is(err, files.ErrNoSpace) {
+			s.log.Error("上传前磁盘空间检查未通过: %v", err)
+			httpx.Fail(w, http.StatusInsufficientStorage, "磁盘空间不足，请先清理文件仓库")
+			return
+		}
+	}
+
 	// 先排队等名额，再开始收数据 —— 被限流的请求不该占用带宽和磁盘。
 	if err := s.acquireUploadSlot(r.Context()); err != nil {
 		return
