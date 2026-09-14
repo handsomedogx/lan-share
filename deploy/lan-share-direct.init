@@ -1,0 +1,100 @@
+#!/bin/sh /etc/rc.common
+#
+# LAN Share · Kwrt/OpenWrt procd 启动脚本（直连模式）
+#
+# ============================================================================
+# 与 lan-share.init（nginx 反代模式）的区别：
+#
+#   本脚本让 Go 直接监听 0.0.0.0:18080，**不经过任何反代**。
+#   好处是部署简单 —— 不需要装/配 nginx，路由器上少一层东西。
+#
+#   ⚠️ 代价是安全档位降低了：整个局域网（含校园网口）都能直接访问 18080。
+#      当前权限模型下，这意味着任何人都可以：
+#        - 浏览并下载文件仓库里的全部文件
+#        - 创建聊天房间（会占内存，房间到期才释放）
+#      上传和删除仍然需要登录，这一点没变。
+#
+#      如果你要的是「只有内网能访问」，用回 lan-share.init + nginx。
+#      如果你就是局域网自用、图省事，这份脚本没问题。
+#
+# 注意：本机的 18080 只允许一个进程监听。若你之前起过别的实例，
+#       必须先停掉，否则会 bind: address already in use。
+# ============================================================================
+#
+# 安装位置：/etc/init.d/lan-share
+# 使用方式：
+#   /etc/init.d/lan-share enable     # 开机自启
+#   /etc/init.d/lan-share start / stop / restart / status
+#
+# 依赖：程序自身是静态链接的 ARM64 单二进制，不依赖 libc/glibc，
+#       因此不需要在这里声明 DEPENDS。
+
+START=95
+STOP=95
+USE_PROCD=1
+
+# 数据分区根目录。所有持久化内容（数据库/文件/日志）都放这里，
+# 绝不写 Overlay，避免反复擦写把路由器闪存写坏。
+#
+# 你的环境里 /data 就是 /mnt/data_mmcblk0p27 的软链，
+# 两个路径等价 —— 这里用真实挂载点，避免依赖软链。
+PROG_DIR="/mnt/data_mmcblk0p27/lan-share"
+PROG="$PROG_DIR/lan-share"
+
+# 直连：监听所有网卡。改成具体 IP（如 10.0.0.1:18080）也能收窄范围。
+LISTEN_ADDR="0.0.0.0:18080"
+
+start_service() {
+	# 数据分区可能挂载得比本服务晚；这里做一次兜底检查并等待。
+	local i=0
+	while [ ! -d "$PROG_DIR" ] && [ $i -lt 30 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+
+	if [ ! -d "$PROG_DIR" ]; then
+		logger -t lan-share "数据目录 $PROG_DIR 不存在，无法启动"
+		return 1
+	fi
+
+	if [ ! -x "$PROG" ]; then
+		logger -t lan-share "程序 $PROG 不存在或不可执行，无法启动"
+		return 1
+	fi
+
+	# 首次运行自动补建数据目录，免得用户手动 mkdir。
+	mkdir -p "$PROG_DIR/data" "$PROG_DIR/files/permanent" \
+	         "$PROG_DIR/files/temporary" "$PROG_DIR/files/chat" \
+	         "$PROG_DIR/logs"
+
+	procd_open_instance
+	procd_set_param command "$PROG"
+
+	# 环境变量：显式指定各路径，避免依赖默认值。
+	procd_set_param env \
+		LANSHARE_ROOT="$PROG_DIR" \
+		LANSHARE_LISTEN="$LISTEN_ADDR"
+
+	# 异常退出自动重启；限流避免「启动即崩溃」时疯狂重启拖垮路由器。
+	procd_set_param respawn 3600 5 5
+
+	# 日志交给 procd 的 stdout 收集（logread 可查）。
+	# 文件日志由程序自己写到 $PROG_DIR/logs/ 并做大小轮转。
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+
+	# 工作目录
+	procd_set_param file "$PROG"
+
+	procd_close_instance
+}
+
+stop_service() {
+	# procd 会负责发 TERM；这里留个钩子方便排查。
+	logger -t lan-share "正在停止 LAN Share"
+}
+
+service_triggers() {
+	# 数据分区挂载后重新拉起服务（首次开机时分区可能尚未就绪）。
+	procd_add_mount_trigger "/mnt/data_mmcblk0p27"
+}
