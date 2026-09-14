@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // 本文件是上传入口的公共实现，文件仓库与聊天室两条链路共用同一套流式解析，
@@ -167,6 +169,26 @@ func translateUploadErr(err error) error {
 	}
 	// 其余（连接中断、非法 boundary 等）原样上抛，由上层当普通失败处理。
 	return err
+}
+
+// durationText 把耗时格式化成便于扫读的形式：短于 1 秒用毫秒，否则用秒。
+func durationText(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	return fmt.Sprintf("%.1fs", d.Seconds())
+}
+
+// speedText 算出平均吞吐（MB/s）。
+//
+// 这个数字是用来分辨瓶颈在哪的：局域网千兆理论上限约 110MB/s，
+// 若实测只有 10MB/s，那多半卡在 Wi-Fi 或路由器 eMMC 的写入上，
+// 而不需要再猜「是不是硬盘不行」。
+func speedText(n int64, d time.Duration) string {
+	if d <= 0 || n <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.1f MB/s", float64(n)/d.Seconds()/(1024*1024))
 }
 
 // isRequestBodyTooLarge 判断错误是否来自请求体超限。

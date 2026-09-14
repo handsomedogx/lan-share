@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"lanshare/internal/files"
 	"lanshare/internal/httpx"
@@ -90,14 +91,17 @@ func (s *Server) handleChatUpload(w http.ResponseWriter, r *http.Request) {
 		displayName = files.SafeDisplayName(up.Filename)
 	}
 
+	start := time.Now()
 	res, err := s.files.Save(string(storage.KindChat), up.Body)
+	elapsed := time.Since(start)
 	if err != nil {
 		if errors.Is(err, files.ErrTooLarge) || isRequestBodyTooLarge(err) {
 			httpx.Fail(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("文件超过上限 %s", files.HumanSize(s.chatMaxUpload)))
 			return
 		}
-		s.log.Error("保存聊天文件失败: %v", err)
+		s.log.Error("聊天文件上传失败: room=%s name=%q duration=%s err=%v",
+			code, displayName, durationText(elapsed), err)
 		httpx.Fail(w, http.StatusInternalServerError, "保存文件失败")
 		return
 	}
@@ -129,8 +133,9 @@ func (s *Server) handleChatUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	rec.ID = id
 
-	s.log.Info("聊天文件上传: id=%d room=%s name=%q size=%d user=%s ip=%s",
-		id, code, displayName, res.Size, rec.OwnerName, httpx.ClientIP(r))
+	s.log.Info("聊天文件上传: id=%d room=%s name=%q size=%d duration=%s speed=%s user=%s ip=%s",
+		id, code, displayName, res.Size, durationText(elapsed), speedText(res.Size, elapsed),
+		rec.OwnerName, httpx.ClientIP(r))
 
 	httpx.WriteJSON(w, http.StatusOK, chatFileResp{
 		ID:          id,

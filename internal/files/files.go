@@ -109,9 +109,11 @@ func (s *Service) Save(kind string, r io.Reader) (*SaveResult, error) {
 		reader = io.LimitReader(r, s.maxBytes+1)
 	}
 
+	// io.Copy 出错时返回的 n 是「中断前已写入多少」，这是区分故障类型的
+	// 关键线索：n 远小于文件说明网络断了，n 接近上限则可能是磁盘满了。
 	n, err := io.Copy(io.MultiWriter(f, hasher), reader)
 	if err != nil {
-		return nil, fmt.Errorf("写入文件失败: %w", err)
+		return nil, fmt.Errorf("写入文件失败（已接收 %s）: %w", HumanSize(n), err)
 	}
 	if s.maxBytes > 0 && n > s.maxBytes {
 		err = ErrTooLarge

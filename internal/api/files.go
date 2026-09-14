@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"lanshare/internal/files"
 	"lanshare/internal/httpx"
@@ -166,15 +167,22 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		displayName = files.SafeDisplayName(up.Filename)
 	}
 
+	// 计时从这里开始：名额已经拿到，排队等待不算进「上传速度」里，
+	// 否则限流造成的等待会把速度数字拉得毫无参考价值。
+	start := time.Now()
+
 	// 到这里才开始真正落盘：网络 → 小缓冲 → 磁盘，只有一次写入。
 	res, err := s.files.Save(string(kind), up.Body)
+	elapsed := time.Since(start)
 	if err != nil {
 		if errors.Is(err, files.ErrTooLarge) || isRequestBodyTooLarge(err) {
 			httpx.Fail(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("文件超过上限 %s", files.HumanSize(s.maxUpload)))
 			return
 		}
-		s.log.Error("保存上传文件失败: %v", err)
+		// err 里已带「已接收多少」（见 files.Save），据此能区分
+		// 「网络中断」和「磁盘写满」这两类完全不同的故障。
+		s.log.Error("上传失败: name=%q duration=%s err=%v", displayName, durationText(elapsed), err)
 		httpx.Fail(w, http.StatusInternalServerError, "保存文件失败")
 		return
 	}
@@ -253,12 +261,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	rec.ID = id
 
 	// 文件上传属于必须记录的事件（文档第 18 节）。
+	// duration + speed 用来回答「到底慢在哪」：千兆局域网理论约 110MB/s，
+	// 实测低一个数量级就该去查 Wi-Fi 或磁盘，而不是靠猜。
 	if deduped {
-		s.log.Info("文件上传（内容重复，复用磁盘文件）: id=%d dupOf=%d name=%q size=%d user=%s ip=%s",
-			id, dedupID, displayName, res.Size, rec.OwnerName, httpx.ClientIP(r))
+		s.log.Info("文件上传（内容重复，复用磁盘文件）: id=%d dupOf=%d name=%q size=%d duration=%s speed=%s user=%s ip=%s",
+			id, dedupID, displayName, res.Size, durationText(elapsed), speedText(res.Size, elapsed),
+			rec.OwnerName, httpx.ClientIP(r))
 	} else {
-		s.log.Info("文件上传: id=%d name=%q size=%d kind=%s user=%s ip=%s",
-			id, displayName, res.Size, kind, rec.OwnerName, httpx.ClientIP(r))
+		s.log.Info("文件上传: id=%d name=%q size=%d kind=%s duration=%s speed=%s sha256=%s user=%s ip=%s",
+			id, displayName, res.Size, kind, durationText(elapsed), speedText(res.Size, elapsed),
+			res.SHA256, rec.OwnerName, httpx.ClientIP(r))
 	}
 
 	httpx.WriteJSON(w, http.StatusOK, toFileResp(rec))
