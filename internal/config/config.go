@@ -56,6 +56,12 @@ type Config struct {
 	// 文件仓库是「长期保存」，可以放开；聊天室是「即时投递」，
 	// 前端的进度条与房间生命周期都不适合超大文件。
 	ChatMaxUploadBytes int64
+
+	// UploadConcurrency 是服务端同时处理的上传数，<=0 表示不限。
+	//
+	// 默认 2 是给路由器定的：同时进行多份「收网络 + 写盘 + SHA256 + fsync」
+	// 会明显抬高负载，而 1～2 路已经能把千兆局域网的磁盘吃满。
+	UploadConcurrency int
 }
 
 const (
@@ -70,6 +76,12 @@ const (
 
 	// DefaultRoot 是路由器上的默认数据根目录。
 	DefaultRoot = "/mnt/data_mmcblk0p27/lan-share"
+
+	// DefaultUploadConcurrency 是默认的同时上传数。
+	//
+	// 前端也按这个数排队（web/js/app.js 的 UPLOAD_CONCURRENCY），
+	// 两边保持一致，正常使用时就不会撞到服务端排队。
+	DefaultUploadConcurrency = 2
 
 	// DefaultChatMaxUpload 是聊天室单文件默认上限（100 MB）。
 	//
@@ -90,6 +102,7 @@ const (
 //	LANSHARE_LOG            日志文件路径
 //	LANSHARE_MAX_UPLOAD_MB  文件仓库单次上传上限（MB），0 表示不限制
 //	LANSHARE_CHAT_UPLOAD_MB 聊天室单文件上限（MB），留空用 DefaultChatMaxUpload
+//	LANSHARE_UPLOAD_CONCURRENCY 服务端同时处理的上传数，0 表示不限，默认 2
 func Load() (*Config, error) {
 	root := env("LANSHARE_ROOT", DefaultRoot)
 
@@ -103,6 +116,7 @@ func Load() (*Config, error) {
 		SessionTTL:         30 * 24 * 3600,       // 30 天
 		TempFileDefaultTTL: 6 * 3600,             // 6 小时
 		ChatMaxUploadBytes: DefaultChatMaxUpload, // 100 MB
+		UploadConcurrency:  DefaultUploadConcurrency,
 	}
 
 	mb := env("LANSHARE_MAX_UPLOAD_MB", "0")
@@ -112,6 +126,16 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("解析 LANSHARE_MAX_UPLOAD_MB 失败: %w", err)
 		}
 		cfg.MaxUploadBytes = v * 1024 * 1024
+	}
+
+	// 上传并发数。设 0 可以关掉服务端限流（只留前端排队），
+	// 一般没必要动 —— 这个闸门的意义就在防绕过前端的客户端。
+	if cs := env("LANSHARE_UPLOAD_CONCURRENCY", ""); cs != "" {
+		var v int
+		if _, err := fmt.Sscanf(cs, "%d", &v); err != nil {
+			return nil, fmt.Errorf("解析 LANSHARE_UPLOAD_CONCURRENCY 失败: %w", err)
+		}
+		cfg.UploadConcurrency = v
 	}
 
 	// 聊天室上传上限单独一个变量：它和文件仓库的定位不同，

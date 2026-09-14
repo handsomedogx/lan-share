@@ -102,6 +102,12 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 // 服务端是流式解析，遇到 file part 就立刻开始落盘，
 // 之后出现的字段已经读不到了（详见 upload.go 里 uploadStream 的注释）。
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	// 先排队等名额，再开始收数据 —— 被限流的请求不该占用带宽和磁盘。
+	if err := s.acquireUploadSlot(r.Context()); err != nil {
+		return
+	}
+	defer s.releaseUploadSlot()
+
 	up, err := openUploadStream(w, r, "file", s.maxUpload)
 	if err != nil {
 		switch {

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"io"
 	"mime/multipart"
@@ -23,6 +24,34 @@ import (
 // 改用 r.MultipartReader() 后，文件 part 本身就是 io.Reader，
 // 直接交给存储层：数据只经过 io.Copy 的一块小缓冲就落盘，
 // 内存占用与文件大小无关，磁盘也只写一遍。
+
+// acquireUploadSlot 占一个上传名额，拿不到就排队等。
+//
+// 为什么是「等」而不是直接返回 429：局域网里上传都是用户主动发起的，
+// 多等几十秒比弹一个失败更容易接受，前端那边的队列也是同样的思路。
+// 等待期间客户端如果取消请求（关页面、断网），ctx 会 Done，立刻放弃排队。
+//
+// 名额必须在开始读请求体之前拿：否则被挡下的请求其实已经把带宽吃了，
+// 限流就失去意义了。
+func (s *Server) acquireUploadSlot(ctx context.Context) error {
+	if s.uploadSem == nil {
+		return nil
+	}
+	select {
+	case s.uploadSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// releaseUploadSlot 归还名额，必须 defer 调用，保证任何失败路径都不漏。
+func (s *Server) releaseUploadSlot() {
+	if s.uploadSem == nil {
+		return
+	}
+	<-s.uploadSem
+}
 
 // ErrUploadTooLarge 表示请求体超过允许的上限。
 var ErrUploadTooLarge = errors.New("上传内容超过大小限制")

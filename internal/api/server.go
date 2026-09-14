@@ -35,6 +35,15 @@ type Server struct {
 	// 聊天是即时投递，前端的 XHR 进度条与房间生命周期都不适合超大文件，
 	// 所以给一个更克制的默认值（见 config.ChatMaxUploadBytes）。
 	chatMaxUpload int64
+
+	// uploadSem 限制「同时正在落盘」的上传数量。
+	//
+	// 前端那边的并发队列只能约束自家页面；开两个浏览器、或者拿 curl 直接
+	// 打接口都能绕过去。而路由器上同时跑 10 个「收网络 + 写磁盘 + 算 SHA256
+	// + fsync」会明显抬高负载，所以闸门必须放在服务端。
+	//
+	// nil 表示不限（配置里显式设为 0 时）。
+	uploadSem chan struct{}
 }
 
 // Options 是构造参数。
@@ -50,6 +59,8 @@ type Options struct {
 	TempFileTTL int
 	// ChatMaxUpload 是聊天室单文件上限，0 表示沿用 MaxUpload。
 	ChatMaxUpload int64
+	// UploadConcurrency 是同时允许的上传数，<=0 表示不限。
+	UploadConcurrency int
 }
 
 // NewServer 创建 API 服务。
@@ -68,6 +79,9 @@ func NewServer(o Options) *Server {
 	}
 	if s.chatMaxUpload <= 0 {
 		s.chatMaxUpload = s.maxUpload
+	}
+	if o.UploadConcurrency > 0 {
+		s.uploadSem = make(chan struct{}, o.UploadConcurrency)
 	}
 	// 房间一销毁就把它名下的聊天文件删干净，让「房间到期自动删除」对文件也成立。
 	s.sessions.SetRoomGoneHandler(s.purgeRoomFiles)

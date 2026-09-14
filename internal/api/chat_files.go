@@ -53,6 +53,13 @@ func (s *Server) handleChatUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 与文件仓库共用一个上传名额池：两条链路抢的是同一块磁盘和 CPU，
+	// 分开限流等于没限。
+	if err := s.acquireUploadSlot(r.Context()); err != nil {
+		return
+	}
+	defer s.releaseUploadSlot()
+
 	// 与文件仓库走同一套流式解析：聊天室也照样会传几百 MB 的安装包，
 	// 只改 /api/files 而放过这里的话，OOM 和二次拷贝会原样留在这条链路上。
 	up, err := openUploadStream(w, r, "file", s.chatMaxUpload)

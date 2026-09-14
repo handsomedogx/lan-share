@@ -162,6 +162,8 @@ func run() error {
 		MaxUpload:     cfg.MaxUploadBytes,
 		TempFileTTL:   cfg.TempFileDefaultTTL,
 		ChatMaxUpload: cfg.ChatMaxUploadBytes,
+
+		UploadConcurrency: cfg.UploadConcurrency,
 	})
 
 	httpSrv := &http.Server{
