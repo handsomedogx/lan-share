@@ -142,7 +142,9 @@ func run() error {
 
 	sessions := session.NewManager()
 	// 把会话管理器交给清理协程：它需要活跃房间号来识别无主的聊天文件。
+	// tmp 目录交给它回收历史临时文件（TMPDIR 已在 config 里指向数据分区）。
 	cleaner := cleanup.New(store, fileSvc, sessions, log)
+	cleaner.SetTmpDir(cfg.TmpDir)
 
 	// 组装静态资源 handler（去掉 web/ 前缀，让 / 直接对应 web/index.html）。
 	webRoot, err := fs.Sub(webFS, "web")

@@ -169,6 +169,51 @@ func (s *Service) HasRoomForUpload(size int64) error {
 	return nil
 }
 
+// stalePartAge 是 .part 文件被视为「残留」的时限。
+const stalePartAge = 24 * time.Hour
+
+// PurgeStaleParts 删除各分类目录里残留的 .part 文件，返回删除个数与释放字节数。
+//
+// .part 是「上传中」的中间态：正常路径下写完就 rename 成正式文件，
+// 写失败则当场删掉，只有进程被杀、路由器掉电这类情况才会留下它们。
+//
+// 只删超过 24 小时的，而且这个 24 小时是刻意留得很宽的：
+// 一次上传不可能持续这么久，且正在写的文件 mtime 会持续更新，
+// 所以即使清理恰好赶上一次超长上传，也不会误删正在写的文件。
+func (s *Service) PurgeStaleParts() (int, int64, error) {
+	cutoff := time.Now().Add(-stalePartAge)
+
+	var count int
+	var freed int64
+	for _, kind := range []string{"permanent", "temporary", "chat"} {
+		dir := s.Dir(kind)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return count, freed, err
+		}
+
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".part") {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil || info.ModTime().After(cutoff) {
+				continue
+			}
+			// 单个文件删失败只跳过，绝不因为一个就中断整轮清理。
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+				continue
+			}
+			count++
+			freed += info.Size()
+		}
+	}
+	return count, freed, nil
+}
+
 // Open 以只读方式打开一个已存储的文件。
 func (s *Service) Open(kind, storedName string) (*os.File, error) {
 	// 二次防御：存储名只可能是我们自己生成的安全字符集。
