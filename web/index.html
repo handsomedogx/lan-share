@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>LAN Share · 局域网传输</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%233b6ff5'/><path d='M9 21l7-11 7 11' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<!-- ============================= 顶栏 ============================= -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="26" height="26"><rect width="32" height="32" rx="9" fill="currentColor"/><path d="M9 21.5l7-11.5 7 11.5" stroke="#fff" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </span>
+    <div class="brand-text">
+      <strong>LAN Share</strong>
+      <small id="brandSub">局域网内容传输</small>
+    </div>
+  </div>
+
+  <div class="topbar-right">
+    <span class="pill" id="netPill" title="与路由器的连接状态">
+      <i class="dot dot-idle"></i><span id="netText">未连接</span>
+    </span>
+    <button class="btn btn-ghost btn-sm" id="btnAdmin" hidden title="管理员选项">管理</button>
+    <div id="userArea" class="user-area">
+      <!-- 由 JS 渲染：未登录显示「登录」，已登录显示用户名 + 登出 -->
+    </div>
+  </div>
+</header>
+
+<!-- ============================= 主体 ============================= -->
+<main class="layout">
+
+  <!-- ---------------------------------------------------- 实时传输区 -->
+  <section class="pane pane-live" id="livePane">
+    <div class="pane-head">
+      <h2>实时传输</h2>
+      <div class="pane-head-actions">
+        <button class="btn btn-ghost btn-sm" id="btnLeave" hidden>退出会话</button>
+        <button class="btn btn-primary btn-sm" id="btnCreate">创建会话</button>
+      </div>
+    </div>
+
+    <!-- 会话状态条 -->
+    <div class="session-bar" id="sessionBar" hidden>
+      <div class="session-code-wrap">
+        <span class="label">房间号</span>
+        <button class="session-code" id="sessionCode" title="点击复制房间号">----</button>
+      </div>
+      <div class="session-meta">
+        <span class="ttl-tag" id="ttlTag" hidden title="房间到期后自动销毁"></span>
+        <span class="label">在线</span>
+        <span class="online-count" id="onlineCount">0</span>
+        <div class="avatar-stack" id="avatarStack"></div>
+      </div>
+    </div>
+
+    <!-- 空态 / 加入表单 -->
+    <div class="live-empty" id="liveEmpty">
+      <div class="empty-art" aria-hidden="true">
+        <svg viewBox="0 0 120 90" width="150" height="112">
+          <rect x="10" y="16" width="44" height="30" rx="7" class="ea-1"/>
+          <rect x="66" y="44" width="44" height="30" rx="7" class="ea-2"/>
+          <path d="M40 40 C 56 40, 50 50, 66 52" class="ea-line" fill="none"/>
+          <circle cx="40" cy="40" r="3.2" class="ea-dot"/>
+          <circle cx="66" cy="52" r="3.2" class="ea-dot"/>
+        </svg>
+      </div>
+      <h3>两台设备，一个房间号</h3>
+      <p>创建房间后把房间号告诉同桌，双方即可实时互传文本与链接。消息不落盘，房间到期后自动销毁。</p>
+
+      <div class="join-row">
+        <input id="joinCode" class="input code-input" type="text" inputmode="latin"
+               autocomplete="off" spellcheck="false" maxlength="8" placeholder="输入房间号">
+        <button class="btn btn-primary" id="btnJoin">加入</button>
+      </div>
+      <p class="join-hint" id="joinHint"></p>
+    </div>
+
+    <!-- 消息列表 -->
+    <div class="messages" id="messages" hidden></div>
+
+    <!-- 输入区 -->
+    <div class="composer" id="composer" hidden>
+      <textarea id="msgInput" class="composer-input" rows="1"
+                placeholder="粘贴链接或输入文本…（Enter 发送 / Shift+Enter 换行）"></textarea>
+      <div class="composer-actions">
+        <label class="switch" title="发送后自动清空输入框">
+          <input type="checkbox" id="autoClear" checked><span>发送后清空</span>
+        </label>
+        <div class="composer-btns">
+          <button class="btn btn-ghost btn-sm" id="btnChatFile" title="发送文件（也可以直接把文件拖进左侧面板）">
+            <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+              <path d="M13.5 7.2l-5 5a2.4 2.4 0 01-3.4-3.4l5.6-5.6a3.6 3.6 0 015.1 5.1l-5.6 5.6a4.8 4.8 0 01-6.8-6.8l4.9-4.9"
+                    fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span>文件</span>
+          </button>
+          <input type="file" id="chatFileInput" hidden multiple>
+          <button class="btn btn-primary" id="btnSend" disabled>发送</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 聊天文件上传进度 -->
+    <div class="upload-list chat-uploads" id="chatUploadList" hidden></div>
+
+    <!-- 拖拽提示（左侧 = 发到房间） -->
+    <div class="drop-veil" id="liveDropVeil"><span>松开即发送到房间</span></div>
+  </section>
+
+  <!-- ---------------------------------------------------- 文件仓库 -->
+  <section class="pane pane-files" id="filesPane">
+    <div class="pane-head">
+      <h2>文件仓库</h2>
+      <div class="pane-head-actions">
+        <button class="btn btn-primary btn-sm" id="btnUpload">上传文件</button>
+        <input type="file" id="fileInput" hidden multiple>
+      </div>
+    </div>
+
+    <!-- 首次部署引导 -->
+    <div class="setup-banner" id="setupBanner" hidden>
+      <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+        <circle cx="10" cy="10" r="7.4" fill="none" stroke="currentColor" stroke-width="1.7"/>
+        <path d="M10 6.2v4.6M10 13.5h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <span class="grow"><strong>还没有任何账号。</strong>第一个注册的人将成为管理员，之后注册会自动关闭。</span>
+      <button class="btn btn-primary btn-sm" id="btnSetup">创建管理员账号</button>
+    </div>
+
+    <!-- 用量条 -->
+    <div class="usage" id="usageBar">
+      <span id="usageText">—</span>
+      <span class="usage-hint" id="usageHint"></span>
+    </div>
+
+    <!-- 上传进度 -->
+    <div class="upload-list" id="uploadList" hidden></div>
+
+    <!-- 未登录遮罩：只盖住「上传」按钮，下载 / 浏览对所有人开放。
+         所以文案里不提「下载」，也别再说整个仓库需要登录 —— 会把人劝退。 -->
+    <div class="lock-overlay" id="lockOverlay" hidden>
+      <div class="lock-card">
+        <svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true">
+          <path d="M7 10V7a5 5 0 0110 0v3" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>
+          <rect x="4.5" y="10" width="15" height="10.5" rx="3" fill="none" stroke="currentColor" stroke-width="1.9"/>
+        </svg>
+        <h3 id="lockTitle">登录后可上传</h3>
+        <p id="lockText">浏览和下载无需登录。登录后可以上传、管理自己的文件。</p>
+        <button class="btn btn-primary" id="btnLoginFromLock">立即登录</button>
+      </div>
+    </div>
+
+    <!-- 文件表格 -->
+    <div class="file-scroll">
+      <table class="file-table" id="fileTable">
+        <thead>
+          <tr>
+            <th class="col-name">文件名</th>
+            <th class="col-size">大小</th>
+            <th class="col-time">时间</th>
+            <th class="col-owner">上传者</th>
+            <th class="col-act"></th>
+          </tr>
+        </thead>
+        <tbody id="fileBody"></tbody>
+      </table>
+      <div class="table-empty" id="fileEmpty">
+        <p>文件仓库还是空的</p>
+        <small>上传过的文件会长期保存在路由器数据分区</small>
+      </div>
+    </div>
+
+    <!-- 拖拽提示（右侧 = 存进仓库） -->
+    <div class="drop-veil" id="dropVeil"><span>松开即存入仓库</span></div>
+  </section>
+</main>
+
+<!-- ============================= 底栏 ============================= -->
+<footer class="statusbar">
+  <span id="statusLeft">就绪</span>
+  <span id="statusRight" class="dim"></span>
+</footer>
+
+<!-- ============================= 创建房间弹窗 ============================= -->
+<div class="modal-backdrop" id="createModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="createTitle">
+    <h3 id="createTitle">创建房间</h3>
+    <p class="modal-sub">房间号可以直接口头告诉同桌</p>
+
+    <form id="createForm">
+      <label class="field">
+        <span>房间号</span>
+        <input class="input" id="createCode" type="text" inputmode="latin"
+               autocomplete="off" spellcheck="false" maxlength="8"
+               placeholder="留空自动生成">
+      </label>
+      <p class="field-hint">4 - 8 位字母或数字，大小写不敏感；留空则由系统随机生成</p>
+
+      <div class="field">
+        <span>存活时间</span>
+        <!-- 房间必须有确定的终点：没有「不限时」选项，服务端白名单也不含 0。
+             房间到期即销毁，聊天文件随之清理 —— 这是临时传输的定位。 -->
+        <div class="ttl-options" id="ttlOptions" role="radiogroup" aria-label="存活时间">
+          <button type="button" class="ttl-item" role="radio" data-ttl="10" aria-checked="false">10 分钟</button>
+          <button type="button" class="ttl-item is-active" role="radio" data-ttl="60" aria-checked="true">1 小时</button>
+          <button type="button" class="ttl-item" role="radio" data-ttl="360" aria-checked="false">6 小时</button>
+          <button type="button" class="ttl-item" role="radio" data-ttl="1440" aria-checked="false">24 小时</button>
+        </div>
+      </div>
+      <p class="field-hint">到期后房间自动销毁，消息一并清除</p>
+
+      <p class="form-msg" id="createMsg"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="btnCloseCreate">取消</button>
+        <button type="submit" class="btn btn-primary" id="btnDoCreate">创建</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ============================= 登录 / 注册弹窗 ============================= -->
+<div class="modal-backdrop" id="loginModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
+    <h3 id="loginTitle">登录</h3>
+    <p class="modal-sub" id="loginSub">登录后即可使用长期文件仓库</p>
+
+    <div class="tabs" id="authTabs" hidden>
+      <button type="button" class="tab is-active" data-tab="login" aria-selected="true">登录</button>
+      <button type="button" class="tab" data-tab="register" aria-selected="false">注册</button>
+    </div>
+
+    <form id="loginForm" autocomplete="on">
+      <label class="field">
+        <span>用户名</span>
+        <input class="input" id="loginUser" name="username" type="text" autocomplete="username" required>
+      </label>
+      <label class="field">
+        <span>密码</span>
+        <input class="input" id="loginPass" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <p class="field-hint" id="passHint" hidden>至少 6 位</p>
+      <p class="form-msg" id="loginMsg"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="btnCloseLogin">取消</button>
+        <button type="submit" class="btn btn-primary" id="btnDoLogin">登录</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ============================= 管理员 · 注册开关 ============================= -->
+<div class="modal-backdrop" id="adminModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="adminTitle">
+    <h3 id="adminTitle">管理员选项</h3>
+    <p class="modal-sub">控制谁能自行注册账号</p>
+
+    <div class="setting-row">
+      <div class="setting-text">
+        <strong>开放注册</strong>
+        <span>关闭后，新用户只能由你在这里创建</span>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="regToggle">
+        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+      </label>
+    </div>
+
+    <div class="setting-block">
+      <div class="setting-text">
+        <strong>用户列表</strong>
+        <span id="userCountText">—</span>
+      </div>
+      <div class="user-list" id="userList"></div>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="btn btn-primary" id="btnCloseAdmin">完成</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================= 提示条 ============================= -->
+<div class="toast-wrap" id="toastWrap" aria-live="polite"></div>
+
+<script src="/js/app.js"></script>
+</body>
+</html>
