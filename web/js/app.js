@@ -1356,9 +1356,19 @@ function uploadOne(file, box) {
     setText(pct, p + '%');
   });
 
+  // 进度条到 100% 只代表「浏览器把文件发完了」，不代表服务端存完了 ——
+  // 之后还有 fsync、rename、写库这几步。以前这段时间进度条就停在 100%，
+  // 看起来像卡死；这里显式切到「保存中」，让用户知道还在干活。
+  xhr.upload.addEventListener('load', () => {
+    fill.style.width = '100%';
+    setText(pct, '保存中…');
+    row.classList.add('is-saving');
+  });
+
   xhr.addEventListener('load', () => {
     let data = {};
     try { data = JSON.parse(xhr.responseText); } catch (_) {}
+    row.classList.remove('is-saving');
 
     if (xhr.status >= 200 && xhr.status < 300) {
       row.classList.add('is-done');
@@ -1383,6 +1393,7 @@ function uploadOne(file, box) {
   });
 
   xhr.addEventListener('error', () => {
+    row.classList.remove('is-saving');
     row.classList.add('is-error');
     setText(pct, '失败');
     toast('网络错误，上传失败：' + file.name, 'err');
@@ -1460,9 +1471,17 @@ function sendOneChatFile(file, box) {
     setText(pct, p + '%');
   });
 
+  // 同文件仓库：100% 只是发完了，服务端还要落盘，显式提示「保存中」。
+  xhr.upload.addEventListener('load', () => {
+    fill.style.width = '100%';
+    setText(pct, '保存中…');
+    row.classList.add('is-saving');
+  });
+
   xhr.addEventListener('load', () => {
     let data = {};
     try { data = JSON.parse(xhr.responseText); } catch (_) {}
+    row.classList.remove('is-saving');
 
     if (xhr.status >= 200 && xhr.status < 300) {
       fill.style.width = '100%';
@@ -1505,6 +1524,7 @@ function sendOneChatFile(file, box) {
   });
 
   xhr.addEventListener('error', () => {
+    row.classList.remove('is-saving');
     row.classList.add('is-error');
     setText(pct, '失败');
     toast('网络错误，发送失败：' + file.name, 'err');

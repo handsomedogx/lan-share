@@ -651,6 +651,9 @@ button, input, textarea { font: inherit; color: inherit; }
 .up-fill { height: 100%; width: 0; background: var(--accent); border-radius: 99px; transition: width .2s; }
 .up-item.is-done .up-fill { background: var(--ok); }
 .up-item.is-error .up-fill { background: var(--danger); }
+/* 「保存中」= 浏览器已发完（进度 100%），服务端还在落盘/写库。
+   进度条走满了但事情没完，用文字颜色把这个阶段标出来，别让人以为卡死。 */
+.up-item.is-saving .up-pct { color: var(--accent); }
 
 /* 表格 */
 .file-scroll {
