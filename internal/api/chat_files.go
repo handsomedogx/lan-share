@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"lanshare/internal/files"
 	"lanshare/internal/httpx"
@@ -54,41 +53,31 @@ func (s *Server) handleChatUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.chatMaxUpload > 0 {
-		r.Body = http.MaxBytesReader(w, r.Body, s.chatMaxUpload+1<<20)
-	}
-
-	// 聊天文件通常不大，内存里放 4MB 够用，更大的部分自动落临时文件。
-	if err := r.ParseMultipartForm(4 << 20); err != nil {
-		if strings.Contains(err.Error(), "request body too large") {
+	// 与文件仓库走同一套流式解析：聊天室也照样会传几百 MB 的安装包，
+	// 只改 /api/files 而放过这里的话，OOM 和二次拷贝会原样留在这条链路上。
+	up, err := openUploadStream(w, r, "file", s.chatMaxUpload)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrUploadTooLarge):
 			httpx.Fail(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("文件超过上限 %s", files.HumanSize(s.chatMaxUpload)))
-			return
+		case errors.Is(err, ErrNoFilePart):
+			httpx.Fail(w, http.StatusBadRequest, "没有收到文件")
+		default:
+			httpx.Fail(w, http.StatusBadRequest, "解析上传内容失败")
 		}
-		httpx.Fail(w, http.StatusBadRequest, "解析上传内容失败")
 		return
 	}
-	defer func() {
-		if r.MultipartForm != nil {
-			_ = r.MultipartForm.RemoveAll()
-		}
-	}()
+	defer up.Close()
 
-	fh, header, err := r.FormFile("file")
-	if err != nil {
-		httpx.Fail(w, http.StatusBadRequest, "没有收到文件")
-		return
-	}
-	defer fh.Close()
-
-	displayName := files.SafeDisplayName(r.FormValue("name"))
-	if header != nil && (displayName == "file" || displayName == "") {
-		displayName = files.SafeDisplayName(header.Filename)
+	displayName := files.SafeDisplayName(up.Field("name"))
+	if displayName == "file" {
+		displayName = files.SafeDisplayName(up.Filename)
 	}
 
-	res, err := s.files.Save(string(storage.KindChat), fh)
+	res, err := s.files.Save(string(storage.KindChat), up.Body)
 	if err != nil {
-		if errors.Is(err, files.ErrTooLarge) {
+		if errors.Is(err, files.ErrTooLarge) || isRequestBodyTooLarge(err) {
 			httpx.Fail(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("文件超过上限 %s", files.HumanSize(s.chatMaxUpload)))
 			return

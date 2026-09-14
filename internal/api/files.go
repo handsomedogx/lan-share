@@ -97,30 +97,32 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 //	name  可选，覆盖原始文件名
 //
 // 表单字段名保持 "file"，与浏览器 FormData 的常规写法一致。
+//
+// 注意字段顺序：必须把 kind / name 放在 file 之前。
+// 服务端是流式解析，遇到 file part 就立刻开始落盘，
+// 之后出现的字段已经读不到了（详见 upload.go 里 uploadStream 的注释）。
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	// 用 MaxBytesReader 在读取阶段就限制总请求体，
-	// 避免恶意客户端把路由器内存吃满（multipart 解析会写临时文件）。
-	if s.maxUpload > 0 {
-		r.Body = http.MaxBytesReader(w, r.Body, s.maxUpload+1<<20)
-	}
-
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		if strings.Contains(err.Error(), "request body too large") {
+	up, err := openUploadStream(w, r, "file", s.maxUpload)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrUploadTooLarge):
 			httpx.Fail(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("文件超过上限 %s", files.HumanSize(s.maxUpload)))
-			return
+		case errors.Is(err, ErrNoFilePart):
+			httpx.Fail(w, http.StatusBadRequest, "没有收到文件")
+		default:
+			httpx.Fail(w, http.StatusBadRequest, "解析上传内容失败")
 		}
-		httpx.Fail(w, http.StatusBadRequest, "解析上传内容失败")
 		return
 	}
-	defer func() {
-		if r.MultipartForm != nil {
-			_ = r.MultipartForm.RemoveAll()
-		}
-	}()
+	// 无论成功失败都要关掉 part；落盘失败时存储层自己会删 .part。
+	defer up.Close()
 
-	kind := storage.FileKind(strings.TrimSpace(r.FormValue("kind")))
+	kind := storage.FileKind(up.Field("kind"))
 	if kind == "" {
+		// 正常请求一定会先发 kind（前端保证）。走到这里说明是别的客户端，
+		// 此时文件类型未知，按最严格的 permanent 处理 —— 它要求登录，
+		// 宁可拒绝，也不能让身份未明的请求在不知道存哪儿的情况下落盘。
 		kind = storage.KindPermanent
 	}
 	if kind != storage.KindPermanent && kind != storage.KindTemporary {
@@ -141,21 +143,15 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		owner = httpx.CurrentUser(r, s.store)
 	}
 
-	fh, header, err := r.FormFile("file")
-	if err != nil {
-		httpx.Fail(w, http.StatusBadRequest, "没有收到文件")
-		return
-	}
-	defer fh.Close()
-
-	displayName := files.SafeDisplayName(r.FormValue("name"))
-	if displayName == "file" && header != nil {
-		displayName = files.SafeDisplayName(header.Filename)
+	displayName := files.SafeDisplayName(up.Field("name"))
+	if displayName == "file" {
+		displayName = files.SafeDisplayName(up.Filename)
 	}
 
-	res, err := s.files.Save(string(kind), fh)
+	// 到这里才开始真正落盘：网络 → 小缓冲 → 磁盘，只有一次写入。
+	res, err := s.files.Save(string(kind), up.Body)
 	if err != nil {
-		if errors.Is(err, files.ErrTooLarge) {
+		if errors.Is(err, files.ErrTooLarge) || isRequestBodyTooLarge(err) {
 			httpx.Fail(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("文件超过上限 %s", files.HumanSize(s.maxUpload)))
 			return

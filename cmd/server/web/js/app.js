@@ -1338,8 +1338,13 @@ function uploadOne(file, box) {
   const pct = $('.up-pct', row);
 
   const form = new FormData();
-  form.append('file', file, file.name);
+  // 顺序有讲究：必须先把 kind / name 放进 FormData，再放文件。
+  // 服务端是流式解析 multipart —— 遇到文件 part 就立刻开始边收边写，
+  // 排在文件后面的字段它已经读不到了，kind 拿不到就会按最严格的
+  // 「永久文件（需登录）」处理。
   form.append('kind', 'permanent');
+  form.append('name', file.name);
+  form.append('file', file, file.name);
 
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/files', true);
