@@ -355,6 +355,26 @@ function check(name, cond, detail) {
   check('存活时长档位恰好 4 个', ttlCount === 4, '实际 ' + ttlCount + ' 个');
   check('默认选中 1 小时（60 分钟）', opts.indexOf('data-ttl="60"') >= 0
     && opts.indexOf('data-ttl="60" aria-checked="true"') >= 0);
+
+  // ---- 0.6 内嵌页面：图片灯箱的结构 ----
+  // 服务端把图片标成 isImage、接口也支持 inline，但如果前端页面上
+  // 根本没有灯箱节点，点开大图就是一句空指针 —— 两半要么一起有，要么都没有。
+  check('页面含图片灯箱容器 #lightbox', page.text.indexOf('id="lightbox"') >= 0);
+  check('页面含灯箱大图 #lightboxImg', page.text.indexOf('id="lightboxImg"') >= 0);
+  // 灯箱的下载入口必须存在，否则用户看完大图没有「存下来」的路径。
+  check('页面含灯箱下载入口 #lightboxDownload',
+    page.text.indexOf('id="lightboxDownload"') >= 0);
+
+  // ---- 0.7 内嵌页面：粘贴截图的待发送预览条 ----
+  //
+  // 这条链路没有任何服务端节点可断言：图片是浏览器粘贴事件给的
+  // 内存 File，上传仍在提交时才发生。能在这里守住的只有
+  // 「页面里确实有那个容器和那段脚本」—— 容器缺失时预览条会静默不显示，
+  // 用户粘完图看不到任何反馈，还以为粘贴坏了。
+  check('页面含待发送预览条 #composerAttach',
+    page.text.indexOf('id="composerAttach"') >= 0);
+  check('输入框占位符提示可粘贴截图',
+    page.text.indexOf('Ctrl+V') >= 0 || page.text.indexOf('粘贴') >= 0);
   console.log('');
 
   // 建会话（或复用传入的码）
@@ -436,6 +456,116 @@ function check(name, cond, detail) {
   check('下载聊天文件返回 200', dl.status === 200, 'status=' + dl.status);
   check('下载内容与上传一致', dl.buffer.equals(upBody),
     'got=' + dl.buffer.length + 'B want=' + upBody.length + 'B');
+
+  // 5.3b 图片内联显示 —— 前端缩略图靠的就是这条通道。
+  //
+  // 三件事必须同时成立，缺一个缩略图就出不来：
+  //   ① 卡片带 isImage=true（前端据此决定渲染成图还是文件卡片）；
+  //   ② ?inline=1 返回 image/* 而不是 octet-stream；
+  //   ③ Content-Disposition 是 inline，否则浏览器仍然会当附件下载。
+  console.log('\n--- 5.3b 图片内联预览 ---');
+  // 最小的合法 PNG（1x1 透明像素）。
+  const pngBytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64');
+  const imgUp = await httpMultipart('/api/sessions/' + code + '/files', 'shot.png', pngBytes);
+  check('图片上传成功', imgUp.status === 200 && !!imgUp.body,
+    'status=' + imgUp.status + ' raw=' + imgUp.raw.slice(0, 120));
+  const imgId = imgUp.body && imgUp.body.id;
+
+  if (imgId) {
+    const imgCardP = waitFor(ws, (e) => e.event === 'message'
+      && e.message && e.message.type === 'file' && e.message.fileName === 'shot.png',
+      '图片卡片广播');
+    ws.send({ type: 'file', fileId: imgId });
+    const imgCard = await imgCardP;
+    check('图片卡片带 isImage=true', imgCard.message.isImage === true,
+      'isImage=' + imgCard.message.isImage);
+
+    // 对照组：前面的 note.txt 卡片不该被标成图片。
+    check('非图片卡片没有 isImage 标记', !card.message.isImage,
+      'isImage=' + card.message.isImage);
+
+    const inl = await httpRaw('GET', '/api/chat-files/' + imgId + '?inline=1');
+    check('内联请求返回 200', inl.status === 200, 'status=' + inl.status);
+    check('内联返回 image/png', inl.headers['content-type'] === 'image/png',
+      'ctype=' + inl.headers['content-type']);
+    check('内联是 inline 而非 attachment',
+      String(inl.headers['content-disposition'] || '').startsWith('inline'),
+      'cd=' + inl.headers['content-disposition']);
+    check('内联内容与上传逐字节一致', inl.buffer.equals(pngBytes),
+      'got=' + inl.buffer.length + 'B want=' + pngBytes.length + 'B');
+
+    // 反向验证：非图片即使显式要求 inline，也必须回落成附件。
+    // 没有这条断言，?inline=1 就会变成「把上传内容当页面渲染」的开关。
+    const notImg = await httpRaw('GET', '/api/chat-files/' + fileId + '?inline=1');
+    check('非图片带 inline=1 仍是附件',
+      String(notImg.headers['content-disposition'] || '').startsWith('attachment'),
+      'cd=' + notImg.headers['content-disposition']);
+    check('非图片带 inline=1 仍是 octet-stream',
+      notImg.headers['content-type'] === 'application/octet-stream',
+      'ctype=' + notImg.headers['content-type']);
+
+    // 不带 inline 时，图片也照旧按附件下载（右键「另存为」走这条）。
+    const plain = await httpRaw('GET', '/api/chat-files/' + imgId);
+    check('图片不带 inline 时按附件下载',
+      String(plain.headers['content-disposition'] || '').startsWith('attachment'),
+      'cd=' + plain.headers['content-disposition']);
+  }
+
+  // 5.3c 粘贴截图链路 —— 服务端这边唯一会被影响的一环就是文件名。
+  //
+  // 浏览器从剪贴板给的 File 往往叫 `image.png` / `image` / 空串，
+  // 前端会按 MIME 补一个带扩展名的名字（见 clipboardImageName）。
+  // 服务端的图片判定**只看扩展名**，所以「前端补的名字能不能被认出来」
+  // 就是粘贴功能的成败点 —— 名字不对，截图会渲染成普通文件卡片。
+  console.log('\n--- 5.3c 粘贴截图：文件名 → isImage ---');
+  const pastedName = '截图-20260915-131500.png';   // 前端补名的真实形态：中文+时间戳
+  const pastedUp = await httpMultipart('/api/sessions/' + code + '/files', pastedName, pngBytes);
+  check('带中文与时间戳的粘贴文件名可上传', pastedUp.status === 200 && !!pastedUp.body,
+    'status=' + pastedUp.status + ' raw=' + pastedUp.raw.slice(0, 120));
+
+  const pastedId = pastedUp.body && pastedUp.body.id;
+  if (pastedId) {
+    check('服务端完整保留中文文件名', pastedUp.body.name === pastedName,
+      'name=' + pastedUp.body.name);
+
+    // 注意匹配字段是 fileUrl 而不是 fileId ——
+    // 卡片广播里**没有** fileId 字段（服务端只下发 /api/chat-files/{id} 这个 URL）。
+    // 拿 fileId 去等会永远等不到，白白超时。
+    const cardUrl = '/api/chat-files/' + pastedId;
+    const pastedCardP = waitFor(ws, (e) => e.event === 'message'
+      && e.message && e.message.type === 'file' && e.message.fileUrl === cardUrl,
+      '粘贴图片卡片广播');
+    ws.send({ type: 'file', fileId: pastedId });
+    const pastedCard = await pastedCardP;
+    check('卡片用 fileUrl 而非 fileId 标识文件',
+      pastedCard.message.fileUrl === cardUrl && pastedCard.message.fileId === undefined,
+      'fileUrl=' + pastedCard.message.fileUrl + ' fileId=' + pastedCard.message.fileId);
+    check('粘贴图片被识别为 isImage', pastedCard.message.isImage === true,
+      'isImage=' + pastedCard.message.isImage);
+
+    // 把「名字不对」的反面也钉死：扩展名被补错成 .tmp 时不能被当成图片。
+    // 这正是 clipboardImageName 存在的理由。
+    const wrongUp = await httpMultipart('/api/sessions/' + code + '/files',
+      'image.tmp', pngBytes);
+    const wrongId = wrongUp.body && wrongUp.body.id;
+    if (wrongId) {
+      const wrongUrl = '/api/chat-files/' + wrongId;
+      const wrongCardP = waitFor(ws, (e) => e.event === 'message'
+        && e.message && e.message.type === 'file' && e.message.fileUrl === wrongUrl,
+        '扩展名不符的卡片广播');
+      ws.send({ type: 'file', fileId: wrongId });
+      const wrongCard = await wrongCardP;
+      check('内容确实是 PNG 但扩展名是 .tmp → 不标 isImage',
+        !wrongCard.message.isImage, 'isImage=' + wrongCard.message.isImage);
+
+      const wrongInl = await httpRaw('GET', '/api/chat-files/' + wrongId + '?inline=1');
+      check('扩展名不符时 inline=1 也拿不到 image/*',
+        wrongInl.headers['content-type'] === 'application/octet-stream',
+        'ctype=' + wrongInl.headers['content-type']);
+    }
+  }
 
   // 5.4 伪造 fileId：不存在 / 非聊天文件，一律说「不存在」不泄漏
   const forgedP = waitFor(ws, (e) => e.event === 'error', '伪造 fileId 报错');

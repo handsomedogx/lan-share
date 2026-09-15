@@ -164,7 +164,11 @@ const state = {
   // expiresAt = 0 表示「还没从服务端拿到存活信息」或「房间没有到期时间」。
   // 房间现在必定有时长（没有不限时选项），所以正常路径上它会很快被 hello 填上。
   expiresAt: 0,          // 房间到期时刻（Unix 毫秒）
-  ttlMinutes: 0          // 房间总存活时长（分钟），用于算剩余比例
+  ttlMinutes: 0,         // 房间总存活时长（分钟），用于算剩余比例
+  // 粘贴进输入框、还没点发送的图片。元素形如 { key, file, url }。
+  // 放在前端而不是「粘上就传」：剪贴板里常常是误复制的内容，
+  // 给一次看见缩略图再决定发不发的机会。
+  attachments: []
 };
 
 const LS_CODE = 'lanshare.code';
@@ -686,6 +690,9 @@ function enterRoom(code, info) {
   setText($('#sessionCode'), code);
   setText($('#brandSub'), '房间 ' + code);
   $('#messages').innerHTML = '';
+  // 灯箱里可能是上一个房间的图，切房间时必须先关掉，
+  // 否则会残留在屏幕上指向一个已经不存在的文件。
+  closeLightbox();
   state.members = [];
   state.pendingSelf.clear();
   renderMembers();
@@ -747,6 +754,9 @@ function leaveRoom(silent) {
   state.pendingSelf.clear();
   state.expiresAt = 0;
   state.ttlMinutes = 0;
+  // 退出房间时丢掉待发送的图：它们只对当前房间有意义，
+  // 而且对象 URL 不释放会一直占着那份内存。
+  clearAttachments();
   try { localStorage.removeItem(LS_CODE); } catch (_) {}
 
   $('#liveEmpty').hidden = false;
@@ -783,7 +793,7 @@ function connect() {
     state.reconnectDelay = 1000;
     setNet('ok', '已连接');
     setStatus('会话 ' + state.room + ' · 已连接', '');
-    setText($('#btnSend'), '发送');
+    syncSendButton();
   });
 
   ws.addEventListener('message', (ev) => {
@@ -928,10 +938,38 @@ function contentKey(m) {
 function sendMessage() {
   const input = $('#msgInput');
   const content = trim(input.value);
-  if (!content) return;
+  // 有图没字也算一条要发的消息 —— 截图往往就是不想配文。
+  const hasAttach = state.attachments.length > 0;
+  if (!content && !hasAttach) return;
 
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
     toast('尚未连接，消息未发出', 'err');
+    return;
+  }
+  // 进房间前 composer 是隐藏的，正常不会走到这儿；
+  // 但重连空档里状态可能已清而 DOM 还没隐藏，兜一下免得图被静默吞掉。
+  if (!state.room) {
+    toast('已离开房间，图片未发送', 'err');
+    return;
+  }
+
+  // 先取走队列：sendFilesToRoom 是异步的，若不清空，
+  // 用户在上传途中再按一次 Enter 会把同一批图重复发一遍。
+  const pending = state.attachments.slice();
+  state.attachments = [];
+  renderAttachments();
+
+  // 文字照旧走 WS；图片另走 HTTP 上传 + WS 卡片广播 ——
+  // 两条链路本来就各自独立，这里只负责同时触发。
+  if (pending.length) {
+    sendFilesToRoom(pending.map((a) => a.file));
+    pending.forEach((a) => URL.revokeObjectURL(a.url));
+  }
+
+  if (!content) {
+    // 纯图片：输入框本来就没内容，不需要清。
+    syncSendButton();
+    input.focus();
     return;
   }
 
@@ -969,8 +1007,197 @@ function sendMessage() {
     input.value = '';
     autoGrow(input);
   }
-  setText($('#btnSend'), '发送');
+  syncSendButton();
   input.focus();
+}
+
+/* ------------------------------------------- 剪贴板贴图（待发送队列） */
+
+/**
+ * 同步「发送」按钮的文案与可用状态。
+ *
+ * 唯一入口 —— 输入框打字、粘贴图片、删掉图片、发完清空，全都走这里，
+ * 免得散在五处的 setText 又一次走偏（历史上这个按钮就曾因为
+ * HTML 里写死了 disabled、JS 从没解开而一直是灰的）。
+ *
+ * 判定：有文字 或 有图片 = 可发。两者都没有才禁用。
+ */
+function syncSendButton() {
+  const btn = $('#btnSend');
+  if (!btn) return;
+  const input = $('#msgInput');
+  const n = state.attachments.length;
+
+  btn.disabled = !(n > 0 || trim(input.value) !== '');
+  setText(btn, n ? '发送 ' + n + ' 张' : '发送');
+}
+
+/**
+ * 从粘贴事件里挑出图片文件。
+ *
+ * 两条来源都要看：
+ *   - `clipboardData.files`：Chrome / Edge 截图工具、「复制图片」走这条，
+ *     带完整 MIME（`image/png`）。
+ *   - `clipboardData.items`：Safari / 部分 Firefox 只给 item，
+ *     得用 `getAsFile()` 取。
+ * 两处都拿不到才是「粘的是纯文字」，那属于 textarea 的正常行为，不该拦。
+ *
+ * **不用 `kind === 'file'` 过滤 items**：某些浏览器把截图报成 `kind: 'string'`
+ * 但 `getAsFile()` 仍能返回图片 File —— 按 kind 过滤会漏掉这批。
+ * 统一以「拿到 File 且 type 以 image/ 开头」为准。
+ */
+function pickClipboardImages(dt) {
+  if (!dt) return [];
+  const out = [];
+
+  const push = (f) => {
+    if (!f) return;
+    // 只收 image/*。剪贴板里同时有截图和文件路径（Word/Excel 复制）时，
+    // 那些非图片的 File 会被这里挡掉，不会混进预览条。
+    if (f.type && f.type.indexOf('image/') === 0) out.push(f);
+  };
+
+  if (dt.files && dt.files.length) {
+    for (let i = 0; i < dt.files.length; i++) push(dt.files[i]);
+  }
+  if (!out.length && dt.items && dt.items.length) {
+    for (let i = 0; i < dt.items.length; i++) {
+      const it = dt.items[i];
+      if (it.getAsFile) push(it.getAsFile());
+    }
+  }
+  // getAsFile() 可能对同一张图返回两个条目（files 与 items 各一份），
+  // 用 name+size+lastModified 去重。
+  const seen = new Set();
+  return out.filter((f) => {
+    const k = f.name + '|' + f.size + '|' + f.lastModified;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+/**
+ * 给剪贴板图片起个文件名。
+ *
+ * 剪贴板里的 File 往往叫 `image.png` / 空字符串 / `blob`，还有的直接叫
+ * `image`。而服务端的图片白名单**只看扩展名**（见 internal/files/image.go），
+ * 名字不对就永远拿不到 isImage，图片会被当普通文件渲染成一张卡片 ——
+ * 所以这里必须补出一个带正确扩展名的名字。
+ */
+function clipboardImageName(file, index) {
+  // 从 MIME 反推扩展名。image/jpeg → jpg（不是 jpeg）——
+  // 与 internal/files/image.go 白名单里的写法对齐。
+  const mimeExt = (function () {
+    const t = (file.type || '').toLowerCase();
+    const sub = t.indexOf('/') >= 0 ? t.slice(t.indexOf('/') + 1) : '';
+    switch (sub) {
+      case 'jpeg': return 'jpg';
+      case 'svg+xml': return '';   // 服务端刻意不内联 SVG，别给假希望
+      case '': return '';
+      default: return /^[a-z0-9]{2,5}$/.test(sub) ? sub : '';
+    }
+  })();
+
+  const origin = file.name || '';
+
+  // 原文件名本来就带对扩展名 → 原样沿用，用户看到的名字最自然。
+  if (origin && mimeExt && extOf(origin) === mimeExt) return origin;
+
+  // 否则：剥掉原有扩展名当主名，没有主名就用「截图」。
+  const base = origin ? origin.replace(/\.[a-zA-Z0-9]{1,8}$/, '') : '';
+
+  // 时间戳既方便自己和别人认，也顺手规避了同名歧义；
+  // 同一秒粘多张时靠序号区分。
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate())
+    + '-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+  const suffix = index > 0 ? '-' + (index + 1) : '';
+
+  // mimeExt 为空 = 类型未知或 SVG。仍然给个 .png 的名字让它能当文件发出去，
+  // 只是服务端不会内联它、会渲染成普通文件卡片 —— 这是有意的降级。
+  return (base || '截图') + '-' + stamp + suffix + '.' + (mimeExt || 'png');
+}
+
+/** 把一批剪贴板图片放进待发送队列并刷新预览条。 */
+function attachClipboardImages(files) {
+  if (!files.length) return;
+
+  const MAX = 12;   // 一次粘贴几十张多半是误操作，截断并告知
+  let list = files;
+  if (list.length > MAX) {
+    toast('一次最多粘贴 ' + MAX + ' 张图片，已保留前 ' + MAX + ' 张', 'err');
+    list = list.slice(0, MAX);
+  }
+
+  list.forEach((f, i) => {
+    const named = new File([f], clipboardImageName(f, i), {
+      type: f.type || 'image/png',
+      lastModified: f.lastModified || Date.now()
+    });
+    state.attachments.push({
+      key: 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+      file: named,
+      // 本地预览用 objectURL，不发请求；发送前会 revoke 掉。
+      url: URL.createObjectURL(named)
+    });
+  });
+
+  renderAttachments();
+  syncSendButton();
+}
+
+/** 重画待发送图片预览条。 */
+function renderAttachments() {
+  const box = $('#composerAttach');
+  if (!box) return;
+
+  box.textContent = '';
+  if (!state.attachments.length) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+
+  state.attachments.forEach((a) => {
+    const item = document.createElement('div');
+    item.className = 'attach-item';
+
+    const img = document.createElement('img');
+    img.src = a.url;
+    img.alt = a.file.name;
+    img.title = a.file.name + ' · ' + humanSize(a.file.size);
+    item.appendChild(img);
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'attach-del';
+    del.title = '移除这张图片';
+    del.setAttribute('aria-label', '移除 ' + a.file.name);
+    setText(del, '×');
+    del.addEventListener('click', () => removeAttachment(a.key));
+    item.appendChild(del);
+
+    box.appendChild(item);
+  });
+}
+
+/** 从待发送队列里去掉一张（并释放 objectURL）。 */
+function removeAttachment(key) {
+  const i = state.attachments.findIndex((a) => a.key === key);
+  if (i < 0) return;
+  URL.revokeObjectURL(state.attachments[i].url);
+  state.attachments.splice(i, 1);
+  renderAttachments();
+  syncSendButton();
+}
+
+/** 清空待发送队列（离开房间、发完后收尾用）。 */
+function clearAttachments() {
+  state.attachments.forEach((a) => URL.revokeObjectURL(a.url));
+  state.attachments = [];
+  renderAttachments();
 }
 
 /**
@@ -1007,6 +1234,107 @@ function buildFileCard(m) {
 }
 
 /**
+ * 本地已知的图片扩展名。
+ *
+ * 与服务端 files/image.go 的白名单保持同一份清单 —— 用来给**乐观渲染**兜底：
+ * 文件是我自己刚传上去的，此刻服务端卡片还没回来，但 name 已经在手上，
+ * 靠它就能先把缩略图渲染出来，不用等一个来回（否则图片消息会先闪一下
+ * 文件卡片再变成图）。服务端返回的 isImage 始终是权威值。
+ */
+const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'jfif', 'gif', 'webp', 'bmp', 'avif', 'ico'];
+
+/** 判断一条文件消息是不是图片（服务端标记优先，本地扩展名兜底）。 */
+function isImageMsg(m) {
+  if (m.isImage === true) return true;
+  if (m.isImage === false) return false;
+  return IMAGE_EXTS.indexOf(extOf(m.fileName || '')) >= 0;
+}
+
+/**
+ * 构造一张内联图片消息。
+ *
+ * 用 <img> 直接指向下载接口的 inline 变体（`?inline=1`）：
+ * 浏览器自己负责解码与缩放，服务端不需要装任何图片库 ——
+ * 在 ARM64 路由器上跑缩略图生成是纯负担，而局域网带宽本来就是富余的。
+ *
+ * 尺寸交给 CSS 约束（max-width / max-height），这样不同分辨率的截图
+ * 进到消息流里宽度一致，不会一条撑满、一条只有指甲盖大。
+ */
+function buildImageCard(m) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg-image';
+
+  const url = m.fileUrl || ('/api/chat-files/' + m.fileId);
+  const img = document.createElement('img');
+  // 空格分隔的路径参数：原 URL 上可能已经带了查询串。
+  img.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'inline=1';
+  img.alt = m.fileName || '图片';
+  img.loading = 'lazy';       // 历史回放时不要一次性把几十张图全拉下来
+  img.decoding = 'async';
+  img.draggable = false;
+
+  // 加载失败（文件已被清理、格式其实是坏的、SVG 被服务端拒绝内联……）
+  // 必须降级成原来的文件卡片，而不是留一个破图图标。
+  // 服务端只看扩展名，这种「名字像图片但内容不是」的情况确实会出现。
+  img.addEventListener('error', () => {
+    const card = buildFileCard(m);
+    card.classList.add('is-fallback');
+    wrap.replaceWith(card);
+  });
+
+  wrap.appendChild(img);
+
+  // 点图看大图。用 button 语义包一层会破坏 .msg-image 的圆角裁切，
+  // 所以直接给 img 挂 click + 键盘可达性。
+  img.tabIndex = 0;
+  img.title = '点击查看大图';
+  img.addEventListener('click', () => openLightbox(m, img.src));
+  img.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      openLightbox(m, img.src);
+    }
+  });
+
+  return wrap;
+}
+
+/* --------------------------------------------------------------- 灯箱 */
+
+/**
+ * 打开大图灯箱。
+ *
+ * 刻意不复用 .modal-backdrop：那个类带着卡片式的内边距和边框，
+ * 套在图上会变成「图外面又围了一圈白框」。灯箱要的是纯黑底 + 居中图。
+ */
+function openLightbox(m, src) {
+  const box = $('#lightbox');
+  const img = $('#lightboxImg');
+  if (!box || !img) return;
+
+  setText($('#lightboxName'), m.fileName || '');
+  setText($('#lightboxMeta'), m.fileText || humanSize(m.fileSize || 0));
+  const dl = $('#lightboxDownload');
+  if (dl) {
+    // 下载链接指向**不带** inline 的那个地址 —— 保证拿到的是附件而不是页面。
+    dl.href = m.fileUrl || ('/api/chat-files/' + m.fileId);
+    dl.setAttribute('download', m.fileName || '');
+  }
+  img.src = src;
+  img.alt = m.fileName || '图片';
+  box.hidden = false;
+}
+
+function closeLightbox() {
+  const box = $('#lightbox');
+  const img = $('#lightboxImg');
+  if (!box || box.hidden) return;
+  box.hidden = true;
+  // 清空 src 再关，避免大图继续占着内存（尤其是一次翻过十几张之后）。
+  if (img) img.removeAttribute('src');
+}
+
+/**
  * 渲染一条消息。
  *
  * @param m         消息体
@@ -1034,7 +1362,10 @@ function appendMessage(m, animate, optimistic, mineHint) {
   el.className = 'msg'
     + (mine ? ' is-mine' : '')
     + (m.type === 'link' ? ' is-link' : '')
-    + (m.type === 'file' ? ' is-file' : '');
+    + (m.type === 'file' ? ' is-file' : '')
+    // 图片是 file 的一个「渲染变体」而不是新的消息类型：
+    // 上传、归属校验、随房间销毁的清理三者完全共用，只有画法不同。
+    + (m.type === 'file' && isImageMsg(m) ? ' is-image' : '');
   // 带上 id，方便服务端回显到达时原地替换掉乐观渲染的那条。
   if (m.id) el.id = 'msg-' + m.id;
   el.dataset.sentAt = String(m.sentAt);
@@ -1071,7 +1402,9 @@ function appendMessage(m, animate, optimistic, mineHint) {
     setText($('.msg-link-text', a), m.content);
     body.appendChild(a);
   } else if (m.type === 'file') {
-    body.appendChild(buildFileCard(m));
+    // 图片走缩略图，其余仍是文件名卡片。判定统一交给 isImageMsg，
+    // 与服务端下发的 isImage 保持一个出口，避免两处各判各的。
+    body.appendChild(isImageMsg(m) ? buildImageCard(m) : buildFileCard(m));
   } else {
     // 用 textContent 而不是 innerHTML：用户内容永不参与 HTML 解析。
     body.textContent = m.content;
@@ -1716,7 +2049,10 @@ function sendOneChatFile(file, ui) {
         fileName: data.name,
         fileSize: data.size,
         fileText: data.sizeText,
-        fileUrl: data.downloadUrl
+        fileUrl: data.downloadUrl,
+        // 本地上传时服务端还没回卡片，先用扩展名猜一次 ——
+        // 猜对了图片直接以缩略图形出现，不会「先卡片后变图」闪一下。
+        isImage: IMAGE_EXTS.indexOf(extOf(data.name)) >= 0
       }, true, true);
 
       try {
@@ -1798,8 +2134,30 @@ function bindEvents() {
   const input = $('#msgInput');
   input.addEventListener('input', () => {
     autoGrow(input);
-    setText($('#btnSend'), '发送');
+    syncSendButton();
   });
+
+  // ---- 粘贴截图 ----
+  //
+  // 粘的是图片就拦下来，放进待发送预览条，**不立即上传** ——
+  // 剪贴板里常常是误复制的内容，给一次看见缩略图再决定发不发的机会。
+  //
+  // 粘的是纯文字 / 链接就**什么都不做**，让浏览器按默认行为把文本
+  // 插进 textarea：手动 insertText 会丢掉光标位置、撤销历史和输入法状态。
+  input.addEventListener('paste', (e) => {
+    const files = pickClipboardImages(e.clipboardData);
+    if (!files.length) return;
+
+    // 只有确实拿到了图片才 preventDefault —— 否则会把纯文本粘贴也吃掉。
+    e.preventDefault();
+
+    if (!state.room) {
+      toast('请先创建或加入房间，再粘贴图片', 'err');
+      return;
+    }
+    attachClipboardImages(files);
+  });
+
   input.addEventListener('keydown', (e) => {
     // Enter 发送，Shift+Enter 换行。中文输入法组合中不触发。
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -1890,9 +2248,22 @@ function bindEvents() {
     if (e.target === $('#adminModal')) closeAdmin();
   });
 
+  // ---- 图片灯箱 ----
+  // 点背景（而不是点在图上或工具条上）才关，否则想选个图都会被关掉。
+  const lb = $('#lightbox');
+  if (lb) {
+    lb.addEventListener('mousedown', (e) => {
+      if (e.target === lb || e.target.id === 'lightboxStage') closeLightbox();
+    });
+    const closeBtn = $('#btnCloseLightbox');
+    if (closeBtn) closeBtn.addEventListener('click', closeLightbox);
+  }
+
   // ---- 快捷键 ----
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
+    // 灯箱优先级最高：它是全屏遮罩，先关它再谈别的弹窗。
+    if (!$('#lightbox').hidden) { closeLightbox(); return; }
     if (!$('#adminModal').hidden) { closeAdmin(); return; }
     if (!$('#createModal').hidden) { closeCreate(); return; }
     if (!$('#loginModal').hidden) closeLogin();
@@ -1905,6 +2276,12 @@ function bindEvents() {
       e.returnValue = '';
     }
   });
+
+  // 初始状态：无文字无图 → 按钮灰着。
+  // （HTML 里写死了 disabled，这里必须显式同步一次，否则永远解不开。
+  //   历史上这个按钮就一直是灰的 —— 靠它发送等于没有发送按钮。）
+  syncSendButton();
+  renderAttachments();
 }
 
 function hasFiles(e) {

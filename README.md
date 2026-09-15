@@ -69,7 +69,7 @@ lan-share/
 │   ├── session/             实时会话（房间号 + 存活时长，仅内存）
 │   ├── httpx/               登录 Cookie、JSON 响应辅助
 │   ├── websocket/           手写 RFC 6455 服务端
-│   ├── files/               文件落盘、SHA256、文件名清洗
+│   ├── files/               文件落盘、SHA256、文件名清洗、**图片类型白名单**
 │   ├── cleanup/             无主聊天文件 / 半成品文件 / 会话清理
 │   └── api/                 路由与全部 handler（含 chat_files.go）
 │
@@ -412,6 +412,7 @@ logread | grep lan-share
 |---|---|---|
 | POST | `/api/sessions/{code}/files` | 上传到房间，返回 `{id, name, size, sizeText, downloadUrl}` |
 | GET | `/api/chat-files/{id}` | 下载聊天文件，支持 Range |
+| GET | `/api/chat-files/{id}?inline=1` | **内联预览**（图片缩略图用），仅对图片白名单生效 |
 
 为什么上传**不要求登录**：实时传输区的定位就是「不方便登录聊天软件时随手传点东西」。
 **房间号本身就是凭据** —— 只有拿到它的人才能进这个房间，也才能往里面传。
@@ -454,6 +455,74 @@ logread | grep lan-share
 在退役期间，这个号码既不能被创建、也不会被随机生成器选中、回收协程也会跳过它 ——
 对外的表现就是「号还是被人占着」，直到旧资源彻底清完。
 `kind != chat` 的文件一律 `404`，防止有人拿这个免登录入口下载仓库文件。
+
+#### 图片直接显示
+
+图片不另立消息类型，而是 `type=file` 的一个**渲染变体**：上传链路、房间归属校验、
+随房间销毁的清理三者完全共用，多一个类型只会让每个 `switch` 都多一个分支。
+`session.Message` 上多一个 `isImage` 标记，前端据此决定把同一张卡片画成缩略图
+还是一条文件名。
+
+**为什么标记由服务端判定**：服务端同时也是决定 `Content-Type`、决定能不能
+`inline` 的那一方。标记与响应头出自同一处，才不会出现「卡片说是图片、
+请求回来却是 `attachment`」这种缩略图永远加载不上的两处漂移。
+
+**为什么用 `?inline=1` 而不是给 `Content-Disposition` 加参数**：`<img src>` 要求
+内联响应，而附件下载必须保持 `attachment`。同一个 URL 不可能同时是两者，
+所以显式开一个查询参数 —— 且它只对白名单内的图片生效。
+
+| 文件名 | 是否内联 | 理由 |
+|---|---|---|
+| `.png .jpg .jpeg .jfif .gif .webp .bmp .avif .ico` | ✅ | 浏览器能安全直接解码的位图 |
+| `.svg` | ❌ | **刻意排除**，见下 |
+| 其余一切 | ❌ | 回落 `attachment` + `application/octet-stream` |
+
+> **SVG 为什么被排除**：它是 XML，可以内嵌 `<script>`。即便带了 `nosniff`，
+> 只要 `Content-Type` 是 `image/svg+xml`，直接导航到该 URL 仍会执行脚本
+> （`nosniff` 拦的是「类型嗅探」，不是同类型内的脚本）。而聊天文件是**免登录
+> 可访问**的 —— 内联 SVG 等于给任何进过房间的人发了一个同源脚本执行入口。
+> 代价只是「SVG 不显示缩略图」，很划算。
+
+判定**只看扩展名，不读魔数**：聊天上传是流式的，文件在落盘前就开始转发，
+为了判类型把开头几字节缓冲下来会牵动整条上传链路；而扩展名对「要不要画成图片」
+这个用途已经够用，猜错时前端有 `img.onerror` 降级成文件卡片兜底。
+
+**缩略图不做服务端压缩**：浏览器自己负责解码与缩放，服务端不需要引入任何图片库。
+在 ARM64 路由器上跑缩略图生成是纯负担，而局域网带宽本来就富余。
+尺寸由 CSS 的 `max-width / max-height` 约束，不同分辨率的截图进到消息流里宽度一致。
+详情用**灯箱**看原图，下载入口指向**不带** `inline` 的那个地址，
+保证存下来的是附件而不是页面。
+
+#### 粘贴截图（Ctrl+V）
+
+在消息输入框里直接 `Ctrl+V` 贴截图，图片会出现在输入框上方的**待发送预览条**里
+（可单张删除），点「发送」或按 `Enter` 才真正上传 —— 连同输入框里已写的文字一起发出。
+
+**为什么先排队、不立即上传**：剪贴板里经常是误复制的东西（刚复制的图、别人发的表情）。
+「粘上就传」意味着一旦按错就得等上传完再让别人忽略。给一次看见缩略图再决定的机会，
+成本几乎为零。
+
+**为什么粘文字不拦**：只有真正从剪贴板里取到图片（`image/*`）时才 `preventDefault`，
+纯文本 / 链接一律放行走浏览器默认行为。手动 `insertText` 会丢掉光标位置、
+撤销历史和输入法组合状态，得不偿失。
+
+**两个来源都要看**：`clipboardData.files`（Chrome / Edge 截图工具）和
+`clipboardData.items` + `getAsFile()`（Safari / 部分 Firefox）。
+并且**不用 `kind === 'file'` 过滤 items** —— 某些浏览器把截图报成 `kind: 'string'`
+但 `getAsFile()` 仍能返回图片 File，按 kind 过滤会漏掉这批。
+
+**文件名必须在前端补对**（关键一环）：剪贴板给的 File 常常叫 `image.png`、
+`image` 甚至空字符串，而服务端判定图片**只看扩展名**。所以前端按 MIME 反推扩展名，
+补成 `截图-20260915-131500.png` 这种形态再上传 —— 名字不对，截图就只会渲染成
+一条文件卡片。`image/jpeg` 会归一成 `.jpg`，与服务端白名单的写法对齐。
+
+`image/svg+xml` 不给扩展名（回落成 `.png`）—— 服务端刻意不内联 SVG，
+补一个 `.svg` 名字只会让用户以为它该显示缩略图。
+
+> 顺带修掉一个既有 bug：`#btnSend` 在 HTML 里写死 `disabled`，而 JS 从未解开它，
+> 这个按钮一直是灰的。现在所有会改变「有没有可发内容」的地方统一走
+> `syncSendButton()`：有文字或有图即可发，否则禁用。
+
 
 ### 文件仓库
 
@@ -592,6 +661,9 @@ CountFilesByStoredName 报错  →  记 ERROR 日志，直接返回 200，磁盘
 { "event": "message", "message": { "id":"...", "type":"file", "content":"报表.xlsx", "sender":"...", "sentAt": 0,
                                   "fileName":"报表.xlsx", "fileSize":20480, "fileText":"20.0 KB",
                                   "fileUrl":"/api/chat-files/42", "cid":"..." } }
+{ "event": "message", "message": { "id":"...", "type":"file", "content":"截图.png", "sender":"...", "sentAt": 0,
+                                  "fileName":"截图.png", "fileSize":88064, "fileText":"86.0 KB",
+                                  "fileUrl":"/api/chat-files/43", "isImage": true, "cid":"..." } }
 { "event": "error",   "error": "消息过长（上限 4000 字）" }
 ```
 
@@ -603,6 +675,9 @@ CountFilesByStoredName 报错  →  记 ERROR 日志，直接返回 200，磁盘
 - 广播包含发送者自己；发送者用它认领并替换本地的乐观渲染条目。
 - `cid` **只在实时广播里出现**，写进历史时会清空 —— 历史回放不需要去重语义。
 - 消息**只存内存**，最多保留 300 条。房间到点即整体销毁。
+- `isImage` 与 `cid` 不同：它**会写进历史**（`hist := msg` 只清 `Cid`）。
+  历史回放时前端直接用这个字段，不必重新解析文件名 ——
+  这样即便将来白名单调整，老消息也仍按**当时**的判定渲染。
 - 连接一个**不存在或已过期**的房间号：已过期 → `410 Gone`；
   从未创建过 → 自动按默认时长创建（方便直接分享链接拉人）。
 
@@ -703,13 +778,17 @@ frame3  FIN=1  opcode=continuation(0) payload="lo"     →  一条消息 "hello"
 
 首页布局 · **自定义房间号** · **房间存活时长（10 分钟 / 1 小时 / 6 小时 / 24 小时）** ·
 **到期自动销毁** · WebSocket 实时文本 · 自动识别 URL ·
-**聊天室文件分享（随房间一起销毁）** · **左右双侧拖拽上传** · **自定义开关样式** ·
+**聊天室文件分享（随房间一起销毁）** · **图片直接内联显示 + 灯箱看原图** ·
+**粘贴截图（Ctrl+V）到输入框** · **左右双侧拖拽上传** · **自定义开关样式** ·
 一键复制消息 · **首个用户自动成为管理员** · 可开关的注册 · 管理员后台（用户列表 / 改角色） ·
 登录 · 文件列表 · 上传 / 下载 / 删除（含归属校验）· **双击文件名就地改名** ·
 **文件置顶（置顶项在列表最前）** · SQLite · nginx 反代 · procd 启动
 
 **刻意未做**（按文档要求）：WebRTC、分片/秒传/断点续传、多级文件夹、
 复杂权限（当前只有 admin/user 两级）、聊天记录持久化、Office 预览、视频预览、PWA。
+
+粘贴截图的**待发送队列纯在前端内存里**：刷新或关掉页面就没了（和未发送的文字一样），
+服务端不存任何中间态 —— 这也是「聊天记录不持久化」这条约束的自然延伸。
 
 ---
 
@@ -814,9 +893,21 @@ node scripts/ws-smoke.js 18080
   **`0` 会被拒绝（`400`）** —— 「不限时」档位已移除，房间必须有确定的终点
 - **聊天文件**：上传返回 `200`、WS 卡片由服务端补齐名称/大小/URL、
   下载内容与上传**逐字节一致**、伪造 `fileId` 被拒、上传到不存在的房间返回 `404`
+- **图片内联**：图片卡片带 `isImage=true` 而非图片卡片不带；
+  `?inline=1` 返回 `image/png` 且 `Content-Disposition` 是 `inline`、内容逐字节一致；
+  **反向验证** —— 非图片即使显式带 `inline=1` 仍是 `attachment` + `octet-stream`；
+  图片**不带** `inline` 时仍按附件下载
 - **免登录入口不能被滥用**：仓库文件（`kind=permanent`）走 `/api/chat-files/{id}`
   返回 `404`，而同一文件走正规 `/api/files/{id}` 返回 `200` —— 对照成立才说明拦截有效
 - **仓库的读开放 / 写收紧**：同一文件匿名下载 `200`、匿名删除 `401`
+- **粘贴截图的文件名链路**：带中文与时间戳的名字（`截图-20260915-131500.png`）
+  上传后服务端完整保留原名、卡片带 `isImage=true`；
+  **反向验证** —— 内容确实是 PNG 但扩展名是 `.tmp` 时**不**标 `isImage`，
+  且 `?inline=1` 也拿不到 `image/*`。这正是前端必须补对扩展名的理由
+- **卡片用 `fileUrl` 而非 `fileId` 标识文件**（广播里没有 `fileId` 字段）
+- **前端两半一致**：页面里真的存在 `#lightbox` / `#lightboxImg` / `#lightboxDownload` /
+  `#composerAttach` —— 服务端把图片标好、接口也能内联，但页面上没灯箱节点的话，
+  点开大图就是一句空指针；没预览条节点的话，粘完图看不到任何反馈
 
 **怎么验证仓库权限没被改坏？**
 
@@ -853,7 +944,7 @@ LS_ROOT=./devdata node scripts/dedup-smoke.js
 > 而不是盲目相信数据库里的旧指向。
 
 可用 `node scripts/ws-smoke.js 18080 <房间号>` 复用已有房间。
-当前共 **44 条断言**，全绿。
+当前共 **73 条断言**，全绿。
 
 再跑一遍存活时长的语义测试：
 
@@ -943,6 +1034,23 @@ go test ./... -v
 - `TestDeleteKeepsFileWhileOtherRecordReferencesIt`：还有引用就不删盘
 - `TestDeleteUsesStoredNameNotSHA256`：删除计数口径是 `stored_name`，不是 `sha256`
 - `TestNewMsgIDConcurrent`：16 个协程并发取 ID，断言**无一重复**（消息计数器并发安全）
+
+`internal/files/`（图片白名单）与 `internal/api/`（图片内联，见 `chat_image_test.go`）：
+
+- `TestImageExtWhitelist`：白名单覆盖各图片格式（含大写、多点、中文名），
+  且**明确排除 SVG** —— 它是 XML 可内嵌 `<script>`，而聊天文件免登录可访问
+- `TestImageNameStripsPath`：带路径的名字按最后一段判定；
+  `.txt` 在任何路径形式下都不会被当成图片
+- `TestImageMIMELookup` / `TestImageExtsMatchesMIME`：扩展名清单与 MIME 表是同一份数据，
+  大小写不敏感，白名单外的扩展名返回空串
+- `TestChatFileInlineServesImageMIME`：`?inline=1` → `image/png` + `inline` 头 +
+  `nosniff`，内容逐字节一致，且 `Content-Disposition` 仍带原文件名
+- `TestChatFileInlineIgnoredForNonImage` / `TestChatFileInlineRejectedForSVG`：
+  **安全边界** —— 没有这两条，`?inline=1` 就成了「把上传内容当页面渲染」的开关
+- `TestChatFileWithoutInlineIsStillAttachment`：不带 `inline` 时下载语义完全不变
+- `TestChatFileInlineOtherValueIgnored`：只有精确的 `1` 才开启，
+  `?inline=0 / false / yes /`（空）一律不内联
+- `TestChatFileInlineRoomGoneStill410`：内联分支没有绕过「房间没了就 410」
 
 **为什么左侧拖拽用「计数」而不是布尔值？**
 

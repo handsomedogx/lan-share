@@ -567,6 +567,56 @@ button, input, textarea { font: inherit; color: inherit; }
 .composer-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .composer-btns { display: flex; align-items: center; gap: 8px; }
 
+/* 待发送的粘贴图片。
+   缩略图固定 56px 见方 + object-fit: cover —— 截图分辨率五花八门，
+   不统一尺寸的话这一条会高矮不齐，输入框被顶着上下跳。 */
+.composer-attach {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;   /* 横向滚动条别贴着缩略图 */
+}
+.attach-item {
+  position: relative;
+  flex: 0 0 auto;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.attach-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* 删除按钮压在右上角。默认半透明，悬停整块预览条时才完全显出来 ——
+   一进来就顶着几个深色叉号，看着像出了错。 */
+.attach-del {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, .55);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  opacity: .55;
+  transition: opacity .14s, background .14s;
+}
+.attach-item:hover .attach-del,
+.attach-del:focus-visible { opacity: 1; }
+.attach-del:hover { background: var(--danger); }
+
+/* 名字太长时的提示（title 之外再给一条极简的文本位） */
+.attach-note { font-size: 11px; color: var(--text-3); flex: 0 0 auto; }
+
 /* 「文件」按钮：次要动作，带图标，宽度收紧免得抢「发送」的注意力 */
 #btnChatFile {
   display: inline-flex;
@@ -619,6 +669,120 @@ button, input, textarea { font: inherit; color: inherit; }
 }
 .msg-file-size { font-size: 11px; opacity: .7; font-variant-numeric: tabular-nums; }
 .msg.is-file .msg-body { padding: 0; }
+
+/* 消息里的内联图片。
+ *
+ * 图片气泡不要 .msg-body 那层内边距和背景色 —— 图自己就是内容，
+ * 再套一层灰底会像「照片贴在一张便签上」。所以 is-image 直接把
+ * body 的内边距清零、背景与边框去掉，圆形裁切交给 .msg-image。
+ *
+ * 尺寸用「上限」而不是固定值：
+ *   - max-width 让图永远不超过气泡的 88% 上限，长截图不会撑爆面板；
+ *   - max-height 兜住竖长图，否则一张手机截图能占掉三个屏幕；
+ *   - width/height auto + object-fit 保证不拉伸变形。 */
+.msg.is-image .msg-body {
+  padding: 0;
+  background: none;
+  border: none;
+}
+.msg-image {
+  display: block;
+  line-height: 0;           /* 去掉 img 作为 inline 元素时的基线留白 */
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  max-width: 100%;
+}
+.msg-image img {
+  display: block;
+  max-width: 100%;
+  /* 300px 是按「常见截图比例 + 面板宽度」定的：横图大致能看清内容，
+     又不会一条消息就吃掉大半个消息区，需要细看时点开灯箱即可。 */
+  max-height: 300px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  cursor: zoom-in;
+  background: var(--surface-2);
+}
+.msg-image img:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* 加载失败降级成文件卡片时，别继承 .msg-image 的圆角边框。 */
+.msg-file.is-fallback { border-radius: 0; }
+
+/* 图片气泡的宽度交给内容决定（否则 max-width:88% 会把窄图拉成一条空边）。
+ * 注意 .msg 自身的 max-width 仍是 88%，这里只是允许它小于那个值。 */
+.msg.is-image { width: auto; }
+
+/* ---------------------------------------------------------------- 灯箱 */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 150;            /* 高于普通弹窗(100)，低于 toast(200) */
+  display: flex;
+  flex-direction: column;
+  /* 固定深色而不跟随主题：看图时四周越暗越好，
+     浅色主题下用半透明白底会让图片发灰。 */
+  background: rgba(10, 12, 16, .93);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  animation: fade-in .14s ease-out;
+}
+.lightbox-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+}
+.lightbox-stage img {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: var(--radius-xs);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .5);
+  animation: pop-in .18s cubic-bezier(.2, .9, .3, 1.1);
+}
+.lightbox-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 16px;
+  background: rgba(20, 23, 30, .9);
+  border-top: 1px solid rgba(255, 255, 255, .1);
+  /* 工具条永远压在深色底上，文字用固定浅色，不跟随主题变量 ——
+     浅色主题下 --text 是深色，压在黑底上直接看不见。 */
+  color: #e8eaf0;
+  font-size: 12.5px;
+}
+.lightbox-name {
+  font-weight: 550;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lightbox-meta { color: #98a0b2; font-variant-numeric: tabular-nums; }
+/* 工具条里的占位撑开用全局的 .grow（见 722 行），此处不再重复定义。 */
+
+/* 灯箱里的按钮：幽灵按钮的默认色是跟随主题的深色文字，
+ * 放在深色工具条上会糊掉，这里覆盖成浅色。 */
+.lightbox-bar .btn-ghost {
+  color: #cdd3df;
+  border-color: rgba(255, 255, 255, .22);
+  text-decoration: none;
+}
+.lightbox-bar .btn-ghost:hover {
+  color: #fff;
+  border-color: rgba(255, 255, 255, .45);
+  background: rgba(255, 255, 255, .1);
+}
 
 /* ---------------------------------------------------------------- 文件区 */
 .usage {

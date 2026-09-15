@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"lanshare/internal/files"
@@ -148,13 +149,17 @@ func (s *Server) handleChatUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleChatDownload 下载一个聊天室文件。
+// handleChatDownload 下载或内联预览一个聊天室文件。
 //
-// 路径：GET /api/chat-files/{id}
+// 路径：GET /api/chat-files/{id}[?inline=1]
 //
 // 不需要登录，也不校验房间号 —— 能拿到这个 URL 本身就说明他当时在房间里
 // （URL 是 WebSocket 广播出去的）。反过来若要求带房间号，会让「别人转发过来的
 // 下载链接」失效，而这恰恰是局域网传文件最常见的用法。
+//
+// inline=1 是**图片缩略图**用的：`<img src>` 必须是内联响应，
+// 带上 attachment 头浏览器就不会渲染它。这个参数只对白名单内的图片生效，
+// 其余一律回落成 attachment —— 否则它就变成了「把上传的 HTML 当页面执行」的开关。
 func (s *Server) handleChatDownload(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -194,11 +199,40 @@ func (s *Server) handleChatDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer fh.Close()
 
+	// 图片白名单是这条 inline 通道的唯一闸门。取不到 MIME（不是图片）
+	// 就退回附件语义，即使请求里明确写了 inline=1。
+	mime := ""
+	if r.URL.Query().Get("inline") == "1" {
+		mime = files.ImageMIME(files.ImageExt(f.OriginalName))
+	}
+
+	if mime != "" {
+		// 内联：浏览器按图片渲染。Content-Disposition 仍给出名字，
+		// 这样用户在图片上右键「图片另存为」时拿到的是原本的文件名。
+		w.Header().Set("Content-Type", mime)
+		w.Header().Set("Content-Disposition", "inline"+contentDispositionTail(f.OriginalName))
+		// SVG 已被白名单排除，这里的 MIME 都是位图，不存在内嵌脚本的问题；
+		// nosniff 仍然保留，避免别的类型被嗅探成可执行内容。
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// 缩略图在同一页面上会反复请求，允许短缓存可以省掉滚动时的重复拉取。
+		// 用 private 而不是 public：这是局域网内网资源，不该被中间代理留存。
+		w.Header().Set("Cache-Control", "private, max-age=300")
+		http.ServeContent(w, r, f.OriginalName, f.CreatedAt, fh)
+		return
+	}
+
 	w.Header().Set("Content-Disposition", contentDisposition(f.OriginalName))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	// ServeContent 自带 Range 支持，顺带获得基础断点续传。
 	http.ServeContent(w, r, f.OriginalName, f.CreatedAt, fh)
+}
+
+// contentDispositionTail 构造 `; filename="..."` 这一段，
+// 供 inline 场景拼在 "inline" 后面 —— 只复用名字编码，不复用附件的语义。
+func contentDispositionTail(name string) string {
+	full := contentDisposition(name)
+	return strings.TrimPrefix(full, "attachment")
 }
 
 // purgeRoomFiles 删除某个房间名下的全部聊天文件（记录 + 磁盘）。

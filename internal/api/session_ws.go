@@ -448,6 +448,10 @@ func (s *Server) handleFileMessage(room *session.Room, client *wsClient, in wsIn
 		FileText: humanSize(f.Size),
 		FileURL:  fmt.Sprintf("/api/chat-files/%d", f.ID),
 		Cid:      in.Cid,
+		// 图片标记在这里判定、随卡片一起广播 ——
+		// 前端拿到 isImage 就能直接把卡片渲染成缩略图，
+		// 不必再发一次请求去问「这文件是不是图片」。
+		IsImage: files.IsImageName(f.OriginalName),
 	}
 	hist := msg
 	hist.Cid = ""

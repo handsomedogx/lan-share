@@ -87,8 +87,12 @@
 
     <!-- 输入区 -->
     <div class="composer" id="composer" hidden>
+      <!-- 粘贴进来的图片先在这里排队。手动点「发送」或按 Enter 才真正上传，
+           给一次反悔的机会 —— 剪贴板里常常是误复制的东西。
+           放输入框上方：预览条撑高时，输入框和按钮不会被推着往下跳。 -->
+      <div class="composer-attach" id="composerAttach" hidden></div>
       <textarea id="msgInput" class="composer-input" rows="1"
-                placeholder="粘贴链接或输入文本…（Enter 发送 / Shift+Enter 换行）"></textarea>
+                placeholder="粘贴链接或输入文本…（截图可直接 Ctrl+V 粘贴）"></textarea>
       <div class="composer-actions">
         <label class="switch" title="发送后自动清空输入框">
           <input type="checkbox" id="autoClear" checked><span>发送后清空</span>
@@ -293,6 +297,24 @@
     <div class="modal-actions">
       <button type="button" class="btn btn-primary" id="btnCloseAdmin">完成</button>
     </div>
+  </div>
+</div>
+
+<!-- ============================= 图片灯箱 =============================
+     点聊天里的缩略图打开。刻意不复用 .modal-backdrop：
+     那个类带卡片式的内边距与边框，套在图上会多出一圈白框。
+     灯箱要的是纯暗底 + 居中大图，所以单独一套结构。 -->
+<div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true" aria-label="图片预览">
+  <div class="lightbox-stage" id="lightboxStage">
+    <img id="lightboxImg" alt="">
+  </div>
+  <div class="lightbox-bar">
+    <span class="lightbox-name" id="lightboxName"></span>
+    <span class="lightbox-meta" id="lightboxMeta"></span>
+    <span class="grow"></span>
+    <!-- 下载指向不带 inline 的地址，保证下来的是附件而不是页面 -->
+    <a class="btn btn-ghost btn-sm lightbox-dl" id="lightboxDownload" download>下载原图</a>
+    <button class="btn btn-ghost btn-sm" id="btnCloseLightbox">关闭</button>
   </div>
 </div>
 

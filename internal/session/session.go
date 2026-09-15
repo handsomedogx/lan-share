@@ -64,6 +64,11 @@ const roomIdleTimeout = 2 * time.Hour
 //	text  普通文本
 //	link  链接（服务端识别 URL 后决定，保证各客户端类型一致）
 //	file  文件卡片（文件本体走 HTTP，这里只带元数据与下载地址）
+//
+// 注意 type=file 只描述「载体是文件」这件事，它同时覆盖文档和图片。
+// 图片不另立一种 type：上传链路、房间归属校验、随房间销毁的清理逻辑
+// 三者完全一致，多一个类型只会让每个 switch 都多一个分支。
+// 前端靠 IsImage 决定把同一张卡片渲染成缩略图还是一条文件名。
 type Message struct {
 	ID      string `json:"id"`
 	Type    string `json:"type"` // text | link | file
@@ -77,6 +82,12 @@ type Message struct {
 	FileSize int64  `json:"fileSize,omitempty"`
 	FileText string `json:"fileText,omitempty"`
 	FileURL  string `json:"fileUrl,omitempty"`
+	// IsImage 标记这张卡片对应的是一张可以内联显示的图片。
+	//
+	// 由服务端判定（见 files.ImageExt 的白名单），而不是让前端各猜各的：
+	// 服务端同时也是那个决定 Content-Type、决定能不能 inline 的一方，
+	// 只有它说了算，「下发的标记」和「下载时的响应头」才不会互相矛盾。
+	IsImage bool `json:"isImage,omitempty"`
 	// Cid 原样回传发送方给的临时标识，只用于「这条广播是谁发的」的确认。
 	// 服务端不解释它；历史消息里不带（omitempty 且不写入），
 	// 因为历史回放时前端不需要去重。
