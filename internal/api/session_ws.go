@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"lanshare/internal/files"
@@ -477,12 +478,17 @@ func (s *Server) broadcastRoom(room *session.Room, except *wsClient, out wsOut) 
 	room.Broadcast(b, skip)
 }
 
-// newMsgID 生成消息 ID。用时间戳 + 递增计数即可，无需全局唯一。
-var msgSeq uint64 = 0
+// newMsgID 生成消息 ID。用「时间戳 + 进程内递增序号」即可，
+// 无需全局唯一：它只在单个房间的展示与前端去重里用到。
+//
+// 计数器必须用 atomic：这个函数会被**并发的** HTTP / WebSocket handler
+// 调用（多个房间、多个连接同时发消息），裸的 msgSeq++ 是 data race ——
+// `go test -race` 会直接报出来，高并发下也可能产生重复 ID。
+var msgSeq atomic.Uint64
 
 func newMsgID() string {
-	msgSeq++
-	return strconv.FormatInt(time.Now().UnixMilli(), 36) + "-" + strconv.FormatUint(msgSeq, 36)
+	seq := msgSeq.Add(1)
+	return strconv.FormatInt(time.Now().UnixMilli(), 36) + "-" + strconv.FormatUint(seq, 36)
 }
 
 // defaultLabel 在用户没有指定昵称时生成一个稳定的默认名。

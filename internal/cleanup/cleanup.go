@@ -1,7 +1,10 @@
-// Package cleanup 周期性清理临时文件、无主聊天文件与过期登录会话。
+// Package cleanup 周期性清理无主聊天文件、半成品文件与过期登录会话。
 //
 // 路由器上跑的定时任务必须足够轻：这里每 10 分钟醒一次，
 // 每次只做几条 SQL 与若干次 unlink，几乎不占 CPU。
+//
+// 历史说明：这里曾经还要按 expires_at 回收 temporary 类型的文件，
+// 该类型已随「仓库只保留 permanent」一起移除，那一整段逻辑不复存在。
 package cleanup
 
 import (
@@ -69,27 +72,7 @@ func (w *Worker) Run(ctx context.Context) {
 }
 
 func (w *Worker) tick() {
-	// 1. 过期临时文件：先删磁盘，再删记录。
-	//    顺序很重要 —— 万一删磁盘失败，记录还在，下轮会重试；
-	//    反之则会出现「有记录没文件」的死数据。
-	expired, err := w.store.ExpiredFiles()
-	if err != nil {
-		w.log.Error("查询过期文件失败: %v", err)
-	} else {
-		for _, f := range expired {
-			if err := w.files.Remove(string(f.Kind), f.StoredName); err != nil {
-				w.log.Error("删除过期文件 %s 失败: %v", f.StoredName, err)
-				continue
-			}
-			if err := w.store.DeleteFileRecord(f.ID); err != nil {
-				w.log.Error("删除过期文件记录 %d 失败: %v", f.ID, err)
-				continue
-			}
-			w.log.Info("已清理过期临时文件: %s (%d 字节)", f.OriginalName, f.Size)
-		}
-	}
-
-	// 2. 无主聊天文件。
+	// 1. 无主聊天文件。
 	//
 	// 正常路径下房间销毁会立刻删掉自己名下的文件（session.Manager 的回调）。
 	// 但若进程在「房间已删、文件未删」之间被杀掉，就会留下再也无人引用的文件。
@@ -114,7 +97,7 @@ func (w *Worker) tick() {
 		}
 	}
 
-	// 4. 残留的 .part（半成品文件）。
+	// 2. 残留的 .part（半成品文件）。
 	//
 	// 正常路径下它们写完就 rename、失败就当场删；留到这里的都是
 	// 进程被杀、路由器掉电这类意外留下的，会一直占着磁盘没人认领。
@@ -124,10 +107,10 @@ func (w *Worker) tick() {
 		w.log.Info("已清理残留未完成文件 %d 个（%s）", n, files.HumanSize(freed))
 	}
 
-	// 5. 临时目录里的历史文件。
+	// 3. 临时目录里的历史文件。
 	w.purgeStaleTemp()
 
-	// 6. 过期登录会话。
+	// 4. 过期登录会话。
 	if n, err := w.store.CleanupSessions(); err != nil {
 		w.log.Error("清理过期会话失败: %v", err)
 	} else if n > 0 {

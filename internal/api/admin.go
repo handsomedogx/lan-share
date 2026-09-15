@@ -74,30 +74,38 @@ type settingsReq struct {
 }
 
 // handleAdminSettings 读取或修改运行时设置（GET/PUT /api/admin/settings）。
+//
+// 同一个 handler 同时注册了 GET 与 PUT，所以**必须按方法分流**：
+// GET 正常没有请求体，无条件 DecodeJSON 只会拿到 EOF，
+// 于是「读设置」这个接口会恒定返回 400 —— 前端打开管理面板就报错。
 func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 	if s.requireAdmin(w, r) == nil {
 		return
 	}
 
-	var req settingsReq
-	if err := httpx.DecodeJSON(r, &req); err != nil {
-		httpx.Fail(w, http.StatusBadRequest, "请求格式错误")
-		return
-	}
-
-	if req.RegistrationOpen != nil {
-		v := "0"
-		if *req.RegistrationOpen {
-			v = "1"
-		}
-		if err := s.store.SetSetting(storage.SettingRegistrationOpen, v); err != nil {
-			s.log.Error("保存注册开关失败: %v", err)
-			httpx.Fail(w, http.StatusInternalServerError, "保存设置失败")
+	// 只有 PUT 才有请求体需要解析。
+	if r.Method == http.MethodPut {
+		var req settingsReq
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			httpx.Fail(w, http.StatusBadRequest, "请求格式错误")
 			return
 		}
-		s.log.Info("注册开关更新为: %s", v)
+
+		if req.RegistrationOpen != nil {
+			v := "0"
+			if *req.RegistrationOpen {
+				v = "1"
+			}
+			if err := s.store.SetSetting(storage.SettingRegistrationOpen, v); err != nil {
+				s.log.Error("保存注册开关失败: %v", err)
+				httpx.Fail(w, http.StatusInternalServerError, "保存设置失败")
+				return
+			}
+			s.log.Info("注册开关更新为: %s", v)
+		}
 	}
 
+	// GET 与 PUT 都以「当前真实状态」作为响应，方便前端一次调用拿到结果。
 	open, err := s.store.IsRegistrationOpen()
 	if err != nil {
 		httpx.Fail(w, http.StatusInternalServerError, "读取设置失败")

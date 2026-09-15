@@ -92,7 +92,9 @@ func (s *Server) handleChatUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	res, err := s.files.Save(string(storage.KindChat), up.Body)
+	// 显式传入聊天室自己的上限 —— 不再借用文件仓库的 Service 级上限，
+	// 否则 LANSHARE_CHAT_UPLOAD_MB 会被 LANSHARE_MAX_UPLOAD_MB 二次截断。
+	res, err := s.files.Save(string(storage.KindChat), up.Body, s.chatMaxUpload)
 	elapsed := time.Since(start)
 	if err != nil {
 		if errors.Is(err, files.ErrTooLarge) || isRequestBodyTooLarge(err) {

@@ -379,3 +379,346 @@ func TestRoomCodeIndexWithoutColumn(t *testing.T) {
 		t.Fatalf("重新迁移后 idx_files_room 应被补建: %v", err)
 	}
 }
+
+// TestExpiresAtColumnRemoved 验证废弃的 files.expires_at 列会被迁移移除，
+// 且移除过程不丢数据、不留索引残骸。
+//
+// 背景：expires_at 是 temporary 文件类型的遗迹。该类型已整体移除，
+// 这一列再没有读写方，因此新 schema 里不再包含它，老库则靠一次重建清除。
+func TestExpiresAtColumnRemoved(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "legacy-expires.db")
+
+	raw, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("打开库失败: %v", err)
+	}
+	// 换成「含 expires_at 的旧结构」，并塞一条带过期时间的数据。
+	stmts := []string{
+		`DROP TABLE IF EXISTS files`,
+		`CREATE TABLE files (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			original_name TEXT    NOT NULL,
+			stored_name   TEXT    NOT NULL,
+			size          INTEGER NOT NULL,
+			sha256        TEXT    NOT NULL DEFAULT '',
+			kind          TEXT    NOT NULL DEFAULT 'permanent',
+			owner_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			owner_name    TEXT    NOT NULL DEFAULT '',
+			room_code     TEXT    NOT NULL DEFAULT '',
+			created_at    INTEGER NOT NULL,
+			expires_at    INTEGER,
+			pinned        INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_files_expires ON files(expires_at)`,
+	}
+	for _, q := range stmts {
+		if _, err := raw.db.Exec(q); err != nil {
+			t.Fatalf("构造旧库失败 (%s): %v", q[:28], err)
+		}
+	}
+	// 刻意的取舍：即便 expires_at 有值（这里是一条早已过期的历史临时文件），
+	// 迁移也只丢这个已无意义的过期标记，文件记录本身必须完整保留。
+	if _, err := raw.db.Exec(
+		`INSERT INTO files (original_name, stored_name, size, sha256, kind, owner_name, created_at, expires_at)
+		 VALUES ('old-temp.bin', 'temp-stored', 99, 'cafebabe', 'permanent', 'admin', 1000, 500)`); err != nil {
+		t.Fatalf("写入旧数据失败: %v", err)
+	}
+	// 前置条件：旧表真的有 expires_at，否则这条测试是空的。
+	if has, err := raw.columnExists("files", "expires_at"); err != nil || !has {
+		t.Fatalf("前置条件不成立，旧表应当有 expires_at 列 (has=%v err=%v)", has, err)
+	}
+	_ = raw.Close()
+
+	// 用真正的迁移入口重开。
+	s := newTestStoreAt(t, dbPath)
+
+	// 列必须已被移除 —— 这正是本次改动的目的。
+	if has, err := s.columnExists("files", "expires_at"); err != nil {
+		t.Fatalf("检查列失败: %v", err)
+	} else if has {
+		t.Error("迁移后 files 表不该再有 expires_at 列")
+	}
+
+	// 数据不能丢：那条带过期时间的旧记录仍应完整可读。
+	var name, stored, hash string
+	var size int64
+	if err := s.db.QueryRow(
+		`SELECT original_name, stored_name, size, sha256 FROM files WHERE stored_name = 'temp-stored'`).
+		Scan(&name, &stored, &size, &hash); err != nil {
+		t.Fatalf("旧数据在重建后丢失: %v", err)
+	}
+	if name != "old-temp.bin" || size != 99 || hash != "cafebabe" {
+		t.Errorf("旧数据字段不对: name=%q size=%d hash=%q", name, size, hash)
+	}
+
+	// 索引不能留残骸：DROP TABLE 会连带删掉旧索引，重建时也不该把它建回来。
+	var n string
+	if err := s.db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_files_expires'`).
+		Scan(&n); err == nil {
+		t.Error("idx_files_expires 应当随列一起消失")
+	}
+	// 其余索引必须仍在 —— 重建表会连带删索引，漏建就是隐性性能退化。
+	for _, idx := range []string{"idx_files_kind", "idx_files_room", "idx_files_sha"} {
+		if err := s.db.QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, idx).Scan(&n); err != nil {
+			t.Errorf("迁移后索引 %s 应当存在: %v", idx, err)
+		}
+	}
+
+	// 幂等：再跑一遍不该报错，也不该再次重建。
+	if err := s.migrate(); err != nil {
+		t.Fatalf("重复迁移应当幂等，却失败了: %v", err)
+	}
+	if has, err := s.columnExists("files", "expires_at"); err != nil || has {
+		t.Errorf("二次迁移后列仍不该存在 (has=%v err=%v)", has, err)
+	}
+
+	// 迁移后写入与读取要真的能用。
+	uid := mkUser(t, s, "dave")
+	id := mkPermanent(t, s, "new.txt", "new-stored", "h9", uid)
+	got, err := s.FileByID(id)
+	if err != nil {
+		t.Fatalf("迁移后写入文件失败: %v", err)
+	}
+	if got.OriginalName != "new.txt" {
+		t.Errorf("回读文件名不对: %q", got.OriginalName)
+	}
+}
+
+// TestPinnedColumnMigrates 验证「置顶」这一列能补进老库。
+// 老库的 files 表没有 pinned 列。补列本身很直接，真正容易踩的坑是
+// dropStoredNameUnique() 里那张手工重建的 files_new —— 它的建表语句
+// 与 INSERT...SELECT 列清单是写死的，少写一列，老库重建一次就会
+// 静默丢列。这里刻意造一个「既带 UNIQUE、又没有 pinned」的库，
+// 让重建与补列两条路径都必须走一遍。
+func TestPinnedColumnMigrates(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "legacy-pin.db")
+
+	raw, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("打开库失败: %v", err)
+	}
+	// 换成老结构：stored_name 带 UNIQUE，且没有 pinned 列。
+	stmts := []string{
+		`DROP TABLE IF EXISTS files`,
+		`CREATE TABLE files (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			original_name TEXT    NOT NULL,
+			stored_name   TEXT    NOT NULL UNIQUE,
+			size          INTEGER NOT NULL,
+			sha256        TEXT    NOT NULL DEFAULT '',
+			kind          TEXT    NOT NULL DEFAULT 'permanent',
+			owner_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			owner_name    TEXT    NOT NULL DEFAULT '',
+			room_code     TEXT    NOT NULL DEFAULT '',
+			created_at    INTEGER NOT NULL,
+			expires_at    INTEGER
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_files_kind ON files(kind, created_at DESC)`,
+	}
+	for _, q := range stmts {
+		if _, err := raw.db.Exec(q); err != nil {
+			t.Fatalf("构造旧库失败 (%s): %v", q[:28], err)
+		}
+	}
+	if _, err := raw.db.Exec(
+		`INSERT INTO files (original_name, stored_name, size, sha256, kind, owner_name, created_at)
+		 VALUES ('old.bin', 'old-stored', 7, 'deadbeef', 'permanent', 'admin', 1000)`); err != nil {
+		t.Fatalf("写入旧数据失败: %v", err)
+	}
+
+	// 前置条件：旧表没有 pinned，且确实会触发重建。
+	if has, err := raw.columnExists("files", "pinned"); err != nil || has {
+		t.Fatalf("前置条件不成立，旧表不该有 pinned 列 (has=%v err=%v)", has, err)
+	}
+	var oldDDL string
+	if err := raw.db.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='files'`).Scan(&oldDDL); err != nil {
+		t.Fatalf("读取旧表结构失败: %v", err)
+	}
+	if !needsDropUnique(oldDDL) {
+		t.Fatal("前置条件不成立，旧表的 stored_name 应当带 UNIQUE（否则不会走重建路径）")
+	}
+	_ = raw.Close()
+
+	// 用真正的迁移入口重开。
+	s := newTestStoreAt(t, dbPath)
+
+	has, err := s.columnExists("files", "pinned")
+	if err != nil {
+		t.Fatalf("检查列失败: %v", err)
+	}
+	if !has {
+		t.Fatal("迁移后 files 表应当有 pinned 列")
+	}
+
+	// 重建 + 补列之后，老数据必须一条不少、字段不丢。
+	f, err := s.FileBySHA256("deadbeef", KindPermanent, 0)
+	if err == ErrNotFound {
+		// owner_id 为 NULL 时按 owner 查不到，退回到直接读那一行。
+		var name, stored string
+		var size int64
+		if err := s.db.QueryRow(
+			`SELECT original_name, stored_name, size FROM files WHERE stored_name = 'old-stored'`).
+			Scan(&name, &stored, &size); err != nil {
+			t.Fatalf("旧数据在重建后丢失: %v", err)
+		}
+		if name != "old.bin" || size != 7 {
+			t.Errorf("旧数据字段不对: name=%q size=%d", name, size)
+		}
+	} else if err != nil {
+		t.Fatalf("查询旧数据失败: %v", err)
+	} else {
+		t.Errorf("owner_id 为空的旧记录不该被 owner=0 的去重查询命中: %+v", f)
+	}
+
+	// 老数据默认不置顶，且新写入的记录也能带上这一列。
+	var pinned int64
+	if err := s.db.QueryRow(
+		`SELECT pinned FROM files WHERE stored_name = 'old-stored'`).Scan(&pinned); err != nil {
+		t.Fatalf("读取 pinned 失败: %v", err)
+	}
+	if pinned != 0 {
+		t.Errorf("老数据的 pinned 应当默认 0，得到 %d", pinned)
+	}
+
+	// 补列之后原有的索引不能少（重建路径会连带删索引）。
+	for _, idx := range []string{"idx_files_kind", "idx_files_room", "idx_files_sha"} {
+		var n string
+		if err := s.db.QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, idx).Scan(&n); err != nil {
+			t.Errorf("迁移后索引 %s 应当存在: %v", idx, err)
+		}
+	}
+
+	// 幂等：再跑一遍不该报错。
+	if err := s.migrate(); err != nil {
+		t.Fatalf("重复迁移应当幂等，却失败了: %v", err)
+	}
+
+	// 置顶读写要真的能用。
+	uid := mkUser(t, s, "bob")
+	id := mkPermanent(t, s, "pin.txt", "pin-stored", "h2", uid)
+	if _, err := s.SetFilePinned(id, true); err != nil {
+		t.Fatalf("置顶失败: %v", err)
+	}
+	got, err := s.FileByID(id)
+	if err != nil {
+		t.Fatalf("回读失败: %v", err)
+	}
+	if !got.Pinned {
+		t.Error("置顶后 Pinned 应为 true")
+	}
+}
+
+// TestListFilesPinnedFirst 验证排序：置顶在前，其余按时间从新到旧。
+func TestListFilesPinnedFirst(t *testing.T) {
+	s := newTestStore(t)
+	uid := mkUser(t, s, "carol")
+
+	// 三条记录，created_at 递增：oldest < middle < newest。
+	oldest := mkPermanentAt(t, s, "oldest.txt", "s1", "h1", uid, 100)
+	middle := mkPermanentAt(t, s, "middle.txt", "s2", "h2", uid, 200)
+	newest := mkPermanentAt(t, s, "newest.txt", "s3", "h3", uid, 300)
+
+	// 不置顶时：新的在前。
+	names := listNames(t, s)
+	want := []string{"newest.txt", "middle.txt", "oldest.txt"}
+	if !equalStrings(names, want) {
+		t.Fatalf("默认顺序应当是从新到旧 %v，得到 %v", want, names)
+	}
+
+	// 置顶最早的那条，它必须跳到最前。
+	if _, err := s.SetFilePinned(oldest, true); err != nil {
+		t.Fatalf("置顶失败: %v", err)
+	}
+	names = listNames(t, s)
+	if names[0] != "oldest.txt" {
+		t.Errorf("置顶项应当排在最前，得到 %v", names)
+	}
+
+	// 再置顶一条，新的置顶项里仍是按时间从新到旧。
+	if _, err := s.SetFilePinned(middle, true); err != nil {
+		t.Fatalf("置顶失败: %v", err)
+	}
+	names = listNames(t, s)
+	want = []string{"middle.txt", "oldest.txt", "newest.txt"}
+	if !equalStrings(names, want) {
+		t.Errorf("两个置顶项之间应按时间从新到旧，期望 %v，得到 %v", want, names)
+	}
+
+	// 取消第一条的置顶，它回到普通区的最前（时间上它最老，所以排最后）。
+	if _, err := s.SetFilePinned(oldest, false); err != nil {
+		t.Fatalf("取消置顶失败: %v", err)
+	}
+	names = listNames(t, s)
+	want = []string{"middle.txt", "newest.txt", "oldest.txt"}
+	if !equalStrings(names, want) {
+		t.Errorf("取消置顶后期望 %v，得到 %v", want, names)
+	}
+	_ = newest
+}
+
+// TestRenameFileMissing 改名一个不存在的 id 返回 ErrNotFound。
+func TestRenameFileMissing(t *testing.T) {
+	s := newTestStore(t)
+
+	if _, err := s.RenameFile(12345, "x.txt"); err != ErrNotFound {
+		t.Errorf("改名不存在的记录应当返回 ErrNotFound，得到 %v", err)
+	}
+	if _, err := s.SetFilePinned(12345, true); err != ErrNotFound {
+		t.Errorf("置顶不存在的记录应当返回 ErrNotFound，得到 %v", err)
+	}
+}
+
+// ---- 上面的测试用到的小工具 ----
+
+// mkPermanentAt 像 mkPermanent 一样建记录，但显式指定 created_at（秒）。
+func mkPermanentAt(t *testing.T, s *Store, name, stored, sha string, ownerID int64, createdAt int64) int64 {
+	t.Helper()
+
+	id, err := s.CreateFile(&File{
+		OriginalName: name,
+		StoredName:   stored,
+		Size:         1,
+		SHA256:       sha,
+		Kind:         KindPermanent,
+		OwnerID:      &ownerID,
+		OwnerName:    "u",
+		CreatedAt:    time.Unix(createdAt, 0),
+	})
+	if err != nil {
+		t.Fatalf("创建永久文件记录失败: %v", err)
+	}
+	return id
+}
+
+// listNames 读回永久文件列表里的名字，顺序即服务端排序。
+func listNames(t *testing.T, s *Store) []string {
+	t.Helper()
+
+	list, err := s.ListFiles(KindPermanent)
+	if err != nil {
+		t.Fatalf("列文件失败: %v", err)
+	}
+	names := make([]string, 0, len(list))
+	for _, f := range list {
+		names = append(names, f.OriginalName)
+	}
+	return names
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

@@ -69,10 +69,13 @@ type Conn struct {
 	lastPong time.Time
 }
 
-// message 是读到的一条完整消息。
-type message struct {
-	op   byte
-	data []byte
+// rawFrame 是刚从字节流里读出来的**单个**帧，尚未参与消息拼接。
+type rawFrame struct {
+	fin    bool
+	opcode byte
+	// control 表示这是控制帧（opcode >= 0x8），不受分片规则约束。
+	control bool
+	payload []byte
 }
 
 // IsUpgrade 判断该请求是否是一个 WebSocket 握手请求。
@@ -145,125 +148,166 @@ func computeAccept(key string) string {
 func (c *Conn) RemoteAddr() string { return c.netConn.RemoteAddr().String() }
 
 // ReadMessage 读取下一条完整消息。控制帧在内部处理（ping→pong，close→返回错误）。
+//
+// 这里实现的是 RFC 6455 的**消息层**状态机：一个消息可能由多个帧组成，
+// 首帧是 text/binary 且 FIN=0，后续帧全部是 continuation，末尾一帧 FIN=1。
+//
+// 关键点：控制帧（ping/pong/close）可以插在一个分片消息**中间**，
+// 它们不参与拼接、也不会打断拼接进度。所以不能简单地
+// 「只要还没读完分片就把一切都当 continuation」。
 func (c *Conn) ReadMessage() (byte, []byte, error) {
+	// 分片消息的拼接状态。跨多次 readRawFrame 调用保持。
+	var (
+		messageOpcode byte
+		messageData   []byte
+		fragmented    bool
+	)
+
 	for {
-		msg, err := c.readFrame()
+		f, err := c.readRawFrame()
 		if err != nil {
 			return 0, nil, err
 		}
-		switch msg.op {
-		case opPing:
-			if err := c.writeFrame(opPong, msg.data); err != nil {
-				return 0, nil, err
+
+		// ---- 控制帧：可插入分片中间，不改变拼接状态 ----
+		if f.control {
+			switch f.opcode {
+			case opPing:
+				if err := c.writeFrame(opPong, f.payload); err != nil {
+					return 0, nil, err
+				}
+			case opPong:
+				c.pongMu.Lock()
+				c.lastPong = time.Now()
+				c.pongMu.Unlock()
+			case opClose:
+				// 回一个 close 帧后结束。
+				_ = c.writeFrame(opClose, f.payload)
+				return 0, nil, io.EOF
+			default:
+				return 0, nil, fmt.Errorf("不支持的控制帧: %d", f.opcode)
 			}
 			continue
-		case opPong:
-			c.pongMu.Lock()
-			c.lastPong = time.Now()
-			c.pongMu.Unlock()
-			continue
-		case opClose:
-			// 回一个 close 帧后结束。
-			_ = c.writeFrame(opClose, msg.data)
-			return 0, nil, io.EOF
-		case opText, opBinary:
-			return msg.op, msg.data, nil
-		default:
-			return 0, nil, fmt.Errorf("不支持的操作码: %d", msg.op)
 		}
+
+		// ---- 数据帧 ----
+		switch {
+		case !fragmented && f.opcode == opContinuation:
+			// 没有起始帧就先来续帧 —— 协议错误。
+			return 0, nil, errors.New("收到意外的续帧（此前没有未完成的分片消息）")
+
+		case !fragmented && (f.opcode == opText || f.opcode == opBinary):
+			// 一条新消息的第一帧。
+			messageOpcode = f.opcode
+			messageData = f.payload
+
+		case fragmented && f.opcode == opContinuation:
+			// 续帧：拼接到已有数据后面。
+			messageData = append(messageData, f.payload...)
+
+		case fragmented && (f.opcode == opText || f.opcode == opBinary):
+			// 分片消息中途又出现新的数据帧 —— 协议错误。
+			return 0, nil, errors.New("分片消息未结束时收到新的数据帧")
+
+		default:
+			return 0, nil, fmt.Errorf("不支持的操作码: %d", f.opcode)
+		}
+
+		// 累计大小必须在**每片拼接后**检查：单帧不超限不代表整条消息不超限，
+		// 否则一个恶意客户端可以用无数个小分片把内存撑爆。
+		if len(messageData) > maxMessageSize {
+			return 0, nil, fmt.Errorf("分片消息累计过大: %d", len(messageData))
+		}
+
+		// FIN=1 表示消息结束，可以交给调用方了。
+		if f.fin {
+			if len(messageData) == 0 {
+				// 空消息在协议上合法，但本服务端用不上；统一当作长度 0 处理。
+				return messageOpcode, nil, nil
+			}
+			return messageOpcode, messageData, nil
+		}
+
+		// 还有后续帧。
+		fragmented = true
 	}
 }
 
-// readFrame 读一帧，若是分片则把后续帧拼起来。
-func (c *Conn) readFrame() (*message, error) {
+// readRawFrame 只负责读**一个**帧：解析帧头、长度、掩码并解出 payload。
+//
+// 刻意不承担任何「消息」语义 —— 不拼接、不处理 ping/pong/close。
+// 帧与消息分开两层，是因为它们本来就是两个不同层次的协议概念，
+// 混在一个函数里最容易写出的就是「注释说在拼接、实际没有拼接」这类 bug。
+func (c *Conn) readRawFrame() (*rawFrame, error) {
 	_ = c.netConn.SetReadDeadline(time.Now().Add(pongWait))
 
-	var fin bool
-	var opcode byte
-	var payload []byte
-	first := true
+	h := make([]byte, 2)
+	if _, err := io.ReadFull(c.br, h); err != nil {
+		return nil, err
+	}
 
-	for {
-		h := make([]byte, 2)
-		if _, err := io.ReadFull(c.br, h); err != nil {
+	fin := h[0]&0x80 != 0
+	rsv := h[0] & 0x70
+	if rsv != 0 {
+		return nil, errors.New("不支持扩展（RSV 位非零）")
+	}
+	opcode := h[0] & 0x0F
+
+	masked := h[1]&0x80 != 0
+	length := int64(h[1] & 0x7F)
+
+	switch length {
+	case 126:
+		ext := make([]byte, 2)
+		if _, err := io.ReadFull(c.br, ext); err != nil {
 			return nil, err
 		}
-
-		fin = h[0]&0x80 != 0
-		rsv := h[0] & 0x70
-		if rsv != 0 {
-			return nil, errors.New("不支持扩展（RSV 位非零）")
-		}
-		curOp := h[0] & 0x0F
-
-		masked := h[1]&0x80 != 0
-		length := int64(h[1] & 0x7F)
-
-		switch length {
-		case 126:
-			ext := make([]byte, 2)
-			if _, err := io.ReadFull(c.br, ext); err != nil {
-				return nil, err
-			}
-			length = int64(binary.BigEndian.Uint16(ext))
-		case 127:
-			ext := make([]byte, 8)
-			if _, err := io.ReadFull(c.br, ext); err != nil {
-				return nil, err
-			}
-			length = int64(binary.BigEndian.Uint64(ext))
-		}
-
-		if length < 0 || length > maxMessageSize {
-			return nil, fmt.Errorf("消息过大: %d", length)
-		}
-
-		// 客户端发来的帧必须带掩码（RFC 6455 8.1）。
-		if !masked {
-			return nil, errors.New("客户端帧缺少掩码")
-		}
-
-		var maskKey [4]byte
-		if _, err := io.ReadFull(c.br, maskKey[:]); err != nil {
+		length = int64(binary.BigEndian.Uint16(ext))
+	case 127:
+		ext := make([]byte, 8)
+		if _, err := io.ReadFull(c.br, ext); err != nil {
 			return nil, err
 		}
+		length = int64(binary.BigEndian.Uint64(ext))
+	}
 
-		payload = make([]byte, length)
-		if _, err := io.ReadFull(c.br, payload); err != nil {
-			return nil, err
-		}
-		for i := range payload {
-			payload[i] ^= maskKey[i%4]
-		}
-
-		if first {
-			opcode = curOp
-			first = false
+	// 控制帧的 payload 硬性上限 125 字节（RFC 6455 5.5）。
+	// 用最大长度前置校验：控制帧本就不该长，早点拒绝还能少读一块内存。
+	isControl := opcode >= opClose
+	if isControl {
+		if !fin {
 			// 控制帧不允许分片。
-			if curOp >= opClose && !fin {
-				return nil, errors.New("控制帧不允许分片")
-			}
-			if opcode == opContinuation {
-				return nil, errors.New("收到意外的续帧")
-			}
+			return nil, errors.New("控制帧不允许分片（FIN 必须为 1）")
 		}
-
-		if fin {
-			if opcode == opContinuation {
-				return nil, errors.New("收到意外的续帧")
-			}
-			return &message{op: opcode, data: payload}, nil
-		}
-
-		// 分片：把后续帧数据累加。
-		first = false
-		if opcode != opContinuation {
-			// 保持首个 opcode，继续读后续续帧。
-		}
-		if len(payload) >= maxMessageSize {
-			return nil, errors.New("分片消息累计过大")
+		if length > 125 {
+			return nil, fmt.Errorf("控制帧 payload 过大: %d", length)
 		}
 	}
+
+	// 单帧不能超过单条消息的上限；分片总和的限制在 ReadMessage 里累计检查。
+	if length < 0 || length > maxMessageSize {
+		return nil, fmt.Errorf("消息过大: %d", length)
+	}
+
+	// 客户端发来的帧必须带掩码（RFC 6455 8.1）。
+	if !masked {
+		return nil, errors.New("客户端帧缺少掩码")
+	}
+
+	var maskKey [4]byte
+	if _, err := io.ReadFull(c.br, maskKey[:]); err != nil {
+		return nil, err
+	}
+
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(c.br, payload); err != nil {
+		return nil, err
+	}
+	for i := range payload {
+		payload[i] ^= maskKey[i%4]
+	}
+
+	return &rawFrame{fin: fin, opcode: opcode, control: isControl, payload: payload}, nil
 }
 
 // WriteMessage 发送一条文本/二进制消息。

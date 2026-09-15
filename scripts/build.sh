@@ -12,17 +12,29 @@ cd "$(dirname "$0")/.."
 VERSION="${1:-0.2.0}"
 LDFLAGS="-s -w -X lanshare/internal/api.Version=${VERSION}"
 
-echo "[1/3] 整理依赖..."
+echo "[1/4] 整理依赖..."
 GOOS= GOARCH= CGO_ENABLED= go mod tidy
 
 echo
-echo "[2/3] 构建本机调试版（当前平台）..."
+echo "[2/4] 构建本机调试版（当前平台）..."
 go build -trimpath -ldflags "$LDFLAGS" -o "dist/lan-share-$(go env GOOS)-$(go env GOARCH)" ./cmd/server
 
 echo
-echo "[3/3] 交叉编译 Linux ARM64..."
+echo "[3/4] 交叉编译 Linux ARM64..."
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
   go build -trimpath -ldflags "$LDFLAGS" -o dist/lan-share ./cmd/server
+
+# 这一步不能省：GOOS/GOARCH 万一没生效（比如被上层环境变量顶掉），
+# go build 会**静默**把当前平台的二进制写进 dist/lan-share，
+# 而这个问题只会在路由器上报 Exec format error 时才暴露 —— 已经白跑一趟了。
+# 读回头几个字节断言，别靠信任。
+echo
+echo "[4/4] 校验目标架构..."
+if command -v python >/dev/null 2>&1; then
+  python scripts/verify-arch.py
+else
+  echo "  [SKIP] 未找到 python，请自行确认 dist/lan-share 是 ELF 而非 PE/MZ。"
+fi
 
 echo
 echo "构建完成，产物："

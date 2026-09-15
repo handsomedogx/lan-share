@@ -1,6 +1,6 @@
 #!/bin/sh /etc/rc.common
 #
-# LAN Share · Kwrt/OpenWrt procd 启动脚本
+# LAN Share · Kwrt/OpenWrt procd 启动脚本（nginx 反代模式）
 #
 # 安装位置：/etc/init.d/lan-share
 # 使用方式：
@@ -12,6 +12,31 @@
 #
 # 依赖：程序自身是静态链接的 ARM64 单二进制，不依赖 libc/glibc，
 #       因此不需要在这里声明 DEPENDS。
+#
+# ---------------------------------------------------------------------------
+# 本脚本与 lan-share-direct.init 是**同一套 procd 写法**，
+# 唯一区别是监听地址：这里固定回环，对外统一由 nginx 反代。
+# 两份脚本除 LISTEN 外应当保持一致，改动时请同步修改。
+#
+# procd 写法上的三条硬约束（都是实际踩过的坑，改动时务必保留）：
+#
+#   1) procd_open_instance 必须带**显式实例名**。
+#      部分 Kwrt 组合下无参调用会报
+#      「procd.sh: shift: shift count out of range」。
+#
+#   2) env 在 procd 的 JSON 里是一个 **table**，只能一次性给全。
+#      多次 procd_set_param env 会反复重建 table，常常只留下最后一次，
+#      表现为程序回退到默认监听地址。追加请用 procd_append_param env。
+#
+#   3) 不要直接调用底层的 procd_add_mount_trigger。
+#      它还需要 event/action 等参数，参数不足同样触发
+#      「shift count out of range」。start_service 的 30 秒等待已足够兜底。
+#
+# 注意：上传后务必确认没有 Windows 行尾（CRLF）。
+#   busybox 下 CRLF 会让 USE_PROCD=1 变成 "1\r"，行为走样。
+#   检查：grep -c $'\r' /etc/init.d/lan-share    → 应当输出 0
+#   修正：tr -d '\r' < /etc/init.d/lan-share > /tmp/ls.init && mv /tmp/ls.init /etc/init.d/lan-share
+# ---------------------------------------------------------------------------
 
 START=95
 STOP=95
@@ -19,22 +44,23 @@ USE_PROCD=1
 
 # 数据分区根目录。所有持久化内容（数据库/文件/日志）都放这里，
 # 绝不写 Overlay，避免反复擦写把路由器闪存写坏。
-PROG_DIR="/mnt/data_mmcblk0p27/lan-share"
-PROG="$PROG_DIR/lan-share"
+ROOT="/mnt/data_mmcblk0p27/lan-share"
+PROG="$ROOT/lan-share"
 
 # 监听地址固定为回环，对外统一由 nginx 反代。
-LISTEN_ADDR="127.0.0.1:18080"
+# 这样校园网口碰不到 18080，只能从 nginx 的 :80 进。
+LISTEN="127.0.0.1:18080"
 
 start_service() {
-	# 数据分区可能挂载得比本服务晚；这里做一次兜底检查并等待。
+	# 数据分区可能挂载得比本服务晚；这里做一次兜底等待。
 	local i=0
-	while [ ! -d "$PROG_DIR" ] && [ $i -lt 30 ]; do
+	while [ ! -d "$ROOT" ] && [ "$i" -lt 30 ]; do
 		sleep 1
 		i=$((i + 1))
 	done
 
-	if [ ! -d "$PROG_DIR" ]; then
-		logger -t lan-share "数据目录 $PROG_DIR 不存在，无法启动"
+	if [ ! -d "$ROOT" ]; then
+		logger -t lan-share "数据目录 $ROOT 不存在，无法启动"
 		return 1
 	fi
 
@@ -45,14 +71,18 @@ start_service() {
 
 	# 首次运行自动补建数据目录，免得用户手动 mkdir。
 	# tmp 目录给 Go 的 os.CreateTemp 用（见下面 TMPDIR 的说明）。
-	mkdir -p "$PROG_DIR/data" "$PROG_DIR/files/permanent" \
-	         "$PROG_DIR/files/temporary" "$PROG_DIR/files/chat" \
-	         "$PROG_DIR/logs" "$PROG_DIR/tmp"
+	mkdir -p \
+		"$ROOT/data" \
+		"$ROOT/files/permanent" \
+		"$ROOT/files/chat" \
+		"$ROOT/logs" \
+		"$ROOT/tmp"
 
-	procd_open_instance
+	procd_open_instance main
+
 	procd_set_param command "$PROG"
 
-	# 环境变量：显式指定各路径，避免依赖默认值。
+	# 环境变量一次性给全（env 是 table，见文件头第 2 条）。
 	#
 	# TMPDIR 这条不是可选项：OpenWrt 的 /tmp 是 tmpfs，也就是内存。
 	# Go 标准库（multipart、os.CreateTemp）默认往 TMPDIR 落临时文件，
@@ -60,30 +90,17 @@ start_service() {
 	# 传 125MB 文件时被内核 OOM Killer 直接杀掉。指到数据分区后，
 	# 临时文件才是真正写在 ext4 上，不占 RAM。
 	procd_set_param env \
-		LANSHARE_ROOT="$PROG_DIR" \
-		LANSHARE_LISTEN="$LISTEN_ADDR" \
-		TMPDIR="$PROG_DIR/tmp"
+		"LANSHARE_ROOT=$ROOT" \
+		"LANSHARE_LISTEN=$LISTEN" \
+		"TMPDIR=$ROOT/tmp"
 
 	# 异常退出自动重启；限流避免「启动即崩溃」时疯狂重启拖垮路由器。
 	procd_set_param respawn 3600 5 5
 
 	# 日志交给 procd 的 stdout 收集（logread 可查）。
-	# 文件日志由程序自己写到 $PROG_DIR/logs/ 并做大小轮转。
+	# 文件日志由程序自己写到 $ROOT/logs/ 并做大小轮转。
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 
-	# 工作目录
-	procd_set_param file "$PROG"
-
 	procd_close_instance
-}
-
-stop_service() {
-	# procd 会负责发 TERM；这里留个钩子方便排查。
-	logger -t lan-share "正在停止 LAN Share"
-}
-
-service_triggers() {
-	# 数据分区挂载后重新拉起服务（首次开机时分区可能尚未就绪）。
-	procd_add_mount_trigger "/mnt/data_mmcblk0p27"
 }

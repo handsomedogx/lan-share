@@ -28,9 +28,8 @@ type Server struct {
 	log      *logger.Logger
 	web      http.Handler
 
-	sessionTTL  int
-	maxUpload   int64
-	tempFileTTL int
+	sessionTTL int
+	maxUpload  int64
 	// chatMaxUpload 是聊天室单文件上限，独立于文件仓库的 maxUpload。
 	// 聊天是即时投递，前端的 XHR 进度条与房间生命周期都不适合超大文件，
 	// 所以给一个更克制的默认值（见 config.ChatMaxUploadBytes）。
@@ -48,16 +47,20 @@ type Server struct {
 
 // Options 是构造参数。
 type Options struct {
-	Store       *storage.Store
-	Auth        *auth.Service
-	Files       *files.Service
-	Sessions    *session.Manager
-	Logger      *logger.Logger
-	WebFS       http.Handler
-	SessionTTL  int
-	MaxUpload   int64
-	TempFileTTL int
-	// ChatMaxUpload 是聊天室单文件上限，0 表示沿用 MaxUpload。
+	Store      *storage.Store
+	Auth       *auth.Service
+	Files      *files.Service
+	Sessions   *session.Manager
+	Logger     *logger.Logger
+	WebFS      http.Handler
+	SessionTTL int
+	MaxUpload  int64
+	// ChatMaxUpload 是聊天室单文件上限，0 表示**聊天室不限**。
+	//
+	// 刻意不再回落到 MaxUpload：两个变量必须完全独立，
+	// 否则会出现「LANSHARE_CHAT_UPLOAD_MB=0 本意是不限，
+	// 却被仓库上限接管」这种违反直觉的行为。
+	// 默认值由 config.Load() 自己负责（当前是 100MB）。
 	ChatMaxUpload int64
 	// UploadConcurrency 是同时允许的上传数，<=0 表示不限。
 	UploadConcurrency int
@@ -74,11 +77,7 @@ func NewServer(o Options) *Server {
 		web:           o.WebFS,
 		sessionTTL:    o.SessionTTL,
 		maxUpload:     o.MaxUpload,
-		tempFileTTL:   o.TempFileTTL,
 		chatMaxUpload: o.ChatMaxUpload,
-	}
-	if s.chatMaxUpload <= 0 {
-		s.chatMaxUpload = s.maxUpload
 	}
 	if o.UploadConcurrency > 0 {
 		s.uploadSem = make(chan struct{}, o.UploadConcurrency)
@@ -112,6 +111,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/files", s.handleUpload)
 	mux.HandleFunc("GET /api/files/{id}", s.handleDownload)
 	mux.HandleFunc("DELETE /api/files/{id}", s.handleDelete)
+	// 改名（前端双击文件名就地编辑）。PATCH 而不是 PUT：只改 name 一个字段。
+	mux.HandleFunc("PATCH /api/files/{id}", s.handleRename)
+	// 置顶切换。用子路径而不是 PATCH 上的字段，是因为它是独立的一次状态翻转，
+	// 语义上不该和「改名」挤在同一个请求体里（两者权限相同、但互不相关）。
+	mux.HandleFunc("POST /api/files/{id}/pin", s.handlePin)
 
 	// ---- 状态 ----
 	mux.HandleFunc("GET /api/status", s.handleStatus)
@@ -343,9 +347,6 @@ var Version = "dev"
 
 // sessionTTL 把配置里的秒数转成 time.Duration。
 func sessionTTL(sec int) time.Duration { return time.Duration(sec) * time.Second }
-
-// tempTTL 同上，用于临时文件存活时间。
-func tempTTL(sec int) time.Duration { return time.Duration(sec) * time.Second }
 
 // nowTime 集中取当前时间，便于测试替换。
 func nowTime() time.Time { return time.Now() }

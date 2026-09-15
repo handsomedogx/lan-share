@@ -157,9 +157,19 @@
       </div>
     </div>
 
-    <!-- 文件表格 -->
-    <div class="file-scroll">
+  <!-- 文件表格：表头与表体各是一个 table，靠固定列宽 + table-layout 对齐。
+       改成 `table-layout: fixed` 之后列宽只由 <colgroup> 决定，
+       长文件名不再把「大小 / 时间」两列挤走（那是原来最明显的对齐毛病）。 -->
+  <div class="file-scroll">
+    <div class="file-table-wrap">
       <table class="file-table" id="fileTable">
+        <colgroup>
+          <col class="col-name">
+          <col class="col-size">
+          <col class="col-time">
+          <col class="col-owner">
+          <col class="col-act">
+        </colgroup>
         <thead>
           <tr>
             <th class="col-name">文件名</th>
@@ -176,10 +186,10 @@
         <small>上传过的文件会长期保存在路由器数据分区</small>
       </div>
     </div>
+  </div>
 
     <!-- 拖拽提示（右侧 = 存进仓库） -->
-    <div class="drop-veil" id="dropVeil"><span>松开即存入仓库</span></div>
-  </section>
+    <div class="drop-veil" id="dropVeil"><span>松开即存入仓库</span></div>  </section>
 </main>
 
 <!-- ============================= 底栏 ============================= -->

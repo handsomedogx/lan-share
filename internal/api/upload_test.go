@@ -57,7 +57,7 @@ func newUploadRequest(t *testing.T, parts []partSpec) (*httptest.ResponseRecorde
 
 func TestOpenUploadStreamFieldsBeforeFile(t *testing.T) {
 	w, r := newUploadRequest(t, []partSpec{
-		{field: "kind", content: "temporary"},
+		{field: "kind", content: "permanent"},
 		{field: "name", content: "报告.pdf"},
 		{field: "file", filename: "raw-name.bin", content: "hello world"},
 	})
@@ -68,8 +68,8 @@ func TestOpenUploadStreamFieldsBeforeFile(t *testing.T) {
 	}
 	defer up.Close()
 
-	if got := up.Field("kind"); got != "temporary" {
-		t.Errorf("kind = %q, 期望 temporary", got)
+	if got := up.Field("kind"); got != "permanent" {
+		t.Errorf("kind = %q, 期望 permanent", got)
 	}
 	if got := up.Field("name"); got != "报告.pdf" {
 		t.Errorf("name = %q, 期望 报告.pdf", got)
@@ -92,7 +92,7 @@ func TestOpenUploadStreamFieldsBeforeFile(t *testing.T) {
 func TestOpenUploadStreamFieldsAfterFileAreInvisible(t *testing.T) {
 	w, r := newUploadRequest(t, []partSpec{
 		{field: "file", filename: "a.bin", content: "x"},
-		{field: "kind", content: "temporary"},
+		{field: "kind", content: "permanent"},
 	})
 
 	up, err := openUploadStream(w, r, "file", 0)

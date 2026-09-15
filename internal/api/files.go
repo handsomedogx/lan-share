@@ -27,12 +27,12 @@ type fileResp struct {
 	Kind        string `json:"kind"`
 	Owner       string `json:"owner"`
 	CreatedAt   int64  `json:"createdAt"`
-	ExpiresAt   int64  `json:"expiresAt,omitempty"`
+	Pinned      bool   `json:"pinned"`
 	DownloadURL string `json:"downloadUrl"`
 }
 
 func toFileResp(f *storage.File) fileResp {
-	r := fileResp{
+	return fileResp{
 		ID:          f.ID,
 		Name:        f.OriginalName,
 		Size:        f.Size,
@@ -41,12 +41,9 @@ func toFileResp(f *storage.File) fileResp {
 		Kind:        string(f.Kind),
 		Owner:       f.OwnerName,
 		CreatedAt:   f.CreatedAt.UnixMilli(),
+		Pinned:      f.Pinned,
 		DownloadURL: fmt.Sprintf("/api/files/%d", f.ID),
 	}
-	if f.ExpiresAt != nil {
-		r.ExpiresAt = f.ExpiresAt.UnixMilli()
-	}
-	return r
 }
 
 // ---------------------------------------------------------------- 列表
@@ -54,13 +51,17 @@ func toFileResp(f *storage.File) fileResp {
 // handleListFiles 列出文件仓库内容。
 //
 // 列表对所有人开放（含未登录）—— 局域网里的取用不必先建账号。
-// 写操作（上传、删除）才需要登录。
+// 写操作（上传、删除、改名、置顶）才需要登录。
 func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
+	// 仓库现在只有 permanent 一种类型（temporary 已随按时间过期的
+	// 那套逻辑一起移除）。kind 仍从 query 读取，是为了让老客户端
+	// 显式传 `kind=permanent` 时不必改代码；传了别的值则明确报错，
+	// 而不是静默当成 permanent —— 静默会让调用方以为拿到了想要的数据。
 	kind := storage.FileKind(r.URL.Query().Get("kind"))
 	if kind == "" {
 		kind = storage.KindPermanent
 	}
-	if kind != storage.KindPermanent && kind != storage.KindTemporary {
+	if kind != storage.KindPermanent {
 		httpx.Fail(w, http.StatusBadRequest, "未知的文件类型")
 		return
 	}
@@ -94,7 +95,7 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 // 字段：
 //
 //	file  必填，文件内容
-//	kind  permanent（默认）| temporary
+//	kind  permanent（默认，目前也是唯一合法值）
 //	name  可选，覆盖原始文件名
 //
 // 表单字段名保持 "file"，与浏览器 FormData 的常规写法一致。
@@ -137,29 +138,22 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 无论成功失败都要关掉 part；落盘失败时存储层自己会删 .part。
 	defer up.Close()
 
+	// 仓库现在只有 permanent 一种。kind 仍解析并在非 permanent 时明确报错，
+	// 而不是静默纠正 —— 让调用方立刻知道自己的请求没被按预期理解。
 	kind := storage.FileKind(up.Field("kind"))
 	if kind == "" {
-		// 正常请求一定会先发 kind（前端保证）。走到这里说明是别的客户端，
-		// 此时文件类型未知，按最严格的 permanent 处理 —— 它要求登录，
-		// 宁可拒绝，也不能让身份未明的请求在不知道存哪儿的情况下落盘。
 		kind = storage.KindPermanent
 	}
-	if kind != storage.KindPermanent && kind != storage.KindTemporary {
+	if kind != storage.KindPermanent {
 		httpx.Fail(w, http.StatusBadRequest, "未知的文件类型")
 		return
 	}
 
-	// 永久文件必须登录。
-	var owner *storage.User
-	if kind == storage.KindPermanent {
-		owner = httpx.CurrentUser(r, s.store)
-		if owner == nil {
-			httpx.Fail(w, http.StatusUnauthorized, "请先登录后再上传到文件仓库")
-			return
-		}
-	} else {
-		// 临时文件可选登录（登录了就记名，方便追溯）。
-		owner = httpx.CurrentUser(r, s.store)
+	// 仓库文件必须登录 —— 不登录就不知道文件算谁的，归属链会断掉。
+	owner := httpx.CurrentUser(r, s.store)
+	if owner == nil {
+		httpx.Fail(w, http.StatusUnauthorized, "请先登录后再上传到文件仓库")
+		return
 	}
 
 	displayName := files.SafeDisplayName(up.Field("name"))
@@ -172,7 +166,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	// 到这里才开始真正落盘：网络 → 小缓冲 → 磁盘，只有一次写入。
-	res, err := s.files.Save(string(kind), up.Body)
+	// 显式传入仓库自己的上限，与聊天室的上限互不影响。
+	res, err := s.files.Save(string(kind), up.Body, s.maxUpload)
 	elapsed := time.Since(start)
 	if err != nil {
 		if errors.Is(err, files.ErrTooLarge) || isRequestBodyTooLarge(err) {
@@ -197,54 +192,59 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 若不限定，A 只要上传一份相同内容就能复用到 B 的存储名，
 	// 进而通过「删自己的」把 B 的文件删掉。
 	//
-	// 为什么只对永久文件做：temporary / chat 的删磁盘逻辑是
-	// 「记录没了就 unlink」。它们之间复用存储名会导致一方到期、
-	// 另一方的文件凭空消失。仓库文件是「所有记录都没了才删」，
+	// 为什么只对仓库文件做（也就是 chat 不做）：聊天文件的删磁盘逻辑是
+	// 「记录没了就 unlink」（按房间存亡）。它们之间复用存储名会导致
+	// 一方被清、另一方的文件凭空消失。仓库文件是「所有记录都没了才删」，
 	// 才是唯一安全的场景。
 	stored := res.StoredName
 	deduped := false
 	var dedupID int64
 
-	if kind == storage.KindPermanent && owner != nil {
+	{
 		// 顺序很关键：**先删刚写下的小副本，再复用旧存储名**。
 		//
 		// 反过来的话，一旦之后写库失败需要回滚，回滚删掉的是那个**共享**的
 		// 旧存储名 —— 会把旧记录指向的文件一起删掉，旧记录变成指向空文件。
 		// 按现在的顺序，最坏情况只是白写了一次盘，没有任何记录受损。
 		if old, lookErr := s.store.FileBySHA256(res.SHA256, kind, owner.ID); lookErr == nil {
-			if rmErr := s.files.Remove(string(kind), res.StoredName); rmErr != nil {
-				s.log.Error("去重时删除重复副本失败: %v", rmErr)
-				httpx.Fail(w, http.StatusInternalServerError, "保存文件失败")
-				return
+			// 去重命中前必须先确认旧存储名对应的磁盘文件还在。
+			//
+			// 数据库有记录 ≠ 磁盘有文件：管理员手工删过、文件系统异常、
+			// 外部脚本误删、历史 bug 都可能留下「有记录没文件」。
+			// 若不检查就复用，会把刚上传成功的好文件删掉，转而引用一个
+			// 根本不存在的旧文件，最终产出一条永远下载失败的坏记录 ——
+			// 用户看到的是「上传成功但下载 404」。
+			if !s.files.Exists(string(kind), old.StoredName) {
+				s.log.Error("发现失效的去重记录，保留本次新上传的文件: oldID=%d oldStored=%s sha256=%s",
+					old.ID, old.StoredName, res.SHA256)
+				// 刻意不在这里删除那条坏记录：上传路径不该静默破坏用户元数据。
+				// 旧记录留给以后的「存储一致性检查/修复」功能处理。
+			} else {
+				if rmErr := s.files.Remove(string(kind), res.StoredName); rmErr != nil {
+					s.log.Error("去重时删除重复副本失败: %v", rmErr)
+					httpx.Fail(w, http.StatusInternalServerError, "保存文件失败")
+					return
+				}
+				stored = old.StoredName
+				deduped = true
+				dedupID = old.ID
 			}
-			stored = old.StoredName
-			deduped = true
-			dedupID = old.ID
 		} else if !errors.Is(lookErr, storage.ErrNotFound) {
 			// 查库异常不该阻塞上传：退化为「不去重」，只是多占一份磁盘。
 			s.log.Error("查询重复文件失败: %v", lookErr)
 		}
 	}
 
+	ownerID := owner.ID
 	rec := &storage.File{
 		OriginalName: displayName,
 		StoredName:   stored,
 		Size:         res.Size,
 		SHA256:       res.SHA256,
 		Kind:         kind,
-		OwnerName:    "匿名设备",
+		OwnerID:      &ownerID,
+		OwnerName:    owner.Username,
 		CreatedAt:    nowTime(),
-	}
-	if owner != nil {
-		id := owner.ID
-		rec.OwnerID = &id
-		rec.OwnerName = owner.Username
-	}
-
-	// 临时文件设定过期时间，交给 cleanup 协程回收。
-	if kind == storage.KindTemporary {
-		t := nowTime().Add(tempTTL(s.tempFileTTL))
-		rec.ExpiresAt = &t
 	}
 
 	id, err := s.store.CreateFile(rec)
@@ -281,7 +281,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 // handleDownload 按 ID 下载文件，走普通 HTTP，不使用 WebSocket。
 //
 // 不需要登录：文件仓库是「局域网共享盘」，分享出去一个链接对方就能取，
-// 这才是它存在的意义。真正的闸门在写操作上（上传 / 删除）。
+// 这才是它存在的意义。真正的闸门在写操作上（上传 / 改名 / 置顶 / 删除）。
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -297,12 +297,6 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 		s.log.Error("查询文件失败: %v", err)
 		httpx.Fail(w, http.StatusInternalServerError, "读取文件失败")
-		return
-	}
-
-	// 过期的临时文件直接拒绝，不必等清理协程。
-	if f.Kind == storage.KindTemporary && f.ExpiresAt != nil && nowTime().After(*f.ExpiresAt) {
-		httpx.Fail(w, http.StatusGone, "该临时文件已过期")
 		return
 	}
 
@@ -343,49 +337,25 @@ func contentDisposition(name string) string {
 //
 // 权限规则（下载开放、删除收紧 —— 见 handleDownload 的注释）：
 //   - 永久文件：**必须登录**；登录者还得是上传者本人，或管理员。
-//   - 临时文件：无需登录即可删（凭会话码取用，谁都不能长期占着）。
+//   - 聊天文件：无需登录即可删（凭房间码取用，随房间消亡）。
 //
-// 永久文件这里绝不能放开登录校验：未登录时就无法确定「你是谁」，
+// 这里绝不能放开登录校验：未登录时就无法确定「你是谁」，
 // 匿名删除 = 任何人凭一个列表里的 id 就能抹掉全仓库的文件。
+//
+// 校验逻辑走 writableFile —— 和改名、置顶共用同一份规则。
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || id <= 0 {
-		httpx.Fail(w, http.StatusBadRequest, "非法的文件 ID")
+	f, user, ok := s.writableFile(w, r, "删除")
+	if !ok {
 		return
 	}
-
-	f, err := s.store.FileByID(id)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			httpx.Fail(w, http.StatusNotFound, "文件不存在")
-			return
-		}
-		httpx.Fail(w, http.StatusInternalServerError, "读取文件失败")
-		return
-	}
-
 	// 权限先判，再动数据 —— 别让越权请求走到「删记录」那一步。
-	var user *storage.User
-	if f.Kind == storage.KindPermanent {
-		user = httpx.CurrentUser(r, s.store)
-		if user == nil {
-			httpx.Fail(w, http.StatusUnauthorized, "请先登录后再删除文件")
-			return
-		}
-		// 普通用户只能删自己的；管理员放行。
-		if !user.IsAdmin() && !ownsFile(f, user) {
-			httpx.Fail(w, http.StatusForbidden, "只能删除自己上传的文件")
-			return
-		}
-	} else {
-		user = httpx.CurrentUser(r, s.store)
-	}
+	id := f.ID
 
 	// 删除顺序：先删记录，再按引用计数决定要不要动磁盘。
 	//
 	// 与清理协程的「先删磁盘再删记录」刻意相反，因为这里可能遇到共享文件：
-	// 去重后多条记录指向同一个 stored_name，只有当前上传者的同内容记录
-	// 全部删完（计数归零）才能 unlink，否则会把别人还在用的文件删掉。
+	// 去重后多条记录指向同一个 stored_name，只有引用它的记录**全部**删完
+	// （计数归零）才能 unlink，否则会把别人还在用的文件删掉。
 	//
 	// 先删记录还有个附带好处：权限一撤销文件立刻不可见，语义更干净。
 	if err := s.store.DeleteFileRecord(id); err != nil {
@@ -395,16 +365,27 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if shouldKeepOnDisk(f) {
-		// 同一个上传者的同内容文件共用一份磁盘数据，还有引用就不能删。
-		n, cntErr := s.store.CountFilesBySHA256(f.SHA256, f.Kind, *f.OwnerID)
+		// 磁盘上的物理对象是 stored_name，所以这里问的是
+		// 「还有没有记录引用这个 stored_name」，而不是按 sha256 绕一圈。
+		n, cntErr := s.store.CountFilesByStoredName(f.StoredName)
 		if cntErr != nil {
-			// 计数失败时保守处理：不动磁盘。最坏留一个无主文件，
-			// 下次有人传同样内容会被复用，比误删别人的文件好得多。
-			s.log.Error("统计同内容文件失败: id=%d err=%v", id, cntErr)
+			// 计数失败时**必须**保守处理：绝不能碰磁盘。
+			//
+			// 注意 n 的零值是 0，所以修复前的写法（只记日志、继续往下走）
+			// 实际会误删仍被其它记录引用的文件 —— 与注释里的「保守处理」正好相反。
+			//
+			// 这里仍返回 200 而不是 500：数据库里的用户记录已经删成功了。
+			// 若报 500，用户会以为删除失败，再点一次只会得到「记录不存在」，
+			// 实际只是磁盘上可能多留一个无人引用的文件。
+			// 对这种场景，优先级是 不误删 > 不残留；孤儿留给维护任务清理。
+			s.log.Error("统计磁盘文件引用失败，保守地保留磁盘文件: id=%d stored=%s err=%v",
+				id, f.StoredName, cntErr)
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id})
+			return
 		}
 		if n > 0 {
-			s.log.Info("文件删除（同内容仍有 %d 条记录引用，保留磁盘文件）: id=%d name=%q user=%s ip=%s",
-				n, id, f.OriginalName, userOrAnon(user), httpx.ClientIP(r))
+			s.log.Info("文件删除（磁盘文件仍被 %d 条记录引用，保留磁盘文件）: id=%d stored=%s name=%q user=%s ip=%s",
+				n, id, f.StoredName, f.OriginalName, userOrAnon(user), httpx.ClientIP(r))
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id})
 			return
 		}
@@ -424,13 +405,164 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 // shouldKeepOnDisk 判断删除该记录时是否需要先做引用计数。
 //
-// 只有「永久文件 + 有哈希 + 有主」的记录才可能与他人共享磁盘数据：
-//   - 非永久文件（temporary / chat）从不去重，一记录一文件，直接删即可；
-//   - 空哈希（老数据）不可能匹配到任何人，直接删；
-//   - 无主记录（owner_id 为 NULL）不会被人复用 —— 去重查询要求 owner 相等，
-//     NULL 不参与等值比较，所以它也是独占的。
+// 只有「永久文件」可能与他人共享磁盘数据：
+//   - 非永久文件（chat）从不去重，一记录一文件，直接删即可；
+//
+// 曾经这里还要求「有哈希 + 有主」，那是沿用 sha256 计数口径的残留条件。
+// 现在引用计数直接围绕 stored_name 进行，门槛只剩 kind —— 更宽也更准确：
+// 只要还有别的记录指向同一个磁盘对象就不删，哪怕那条记录的 sha256 为空
+// 或 owner_id 为 NULL（老数据、无主数据同样可能与他人共享存储名）。
 func shouldKeepOnDisk(f *storage.File) bool {
-	return f.Kind == storage.KindPermanent && f.SHA256 != "" && f.OwnerID != nil
+	return f.Kind == storage.KindPermanent
+}
+
+// ---------------------------------------------------------------- 改名 / 置顶
+
+// renameReq 是改名请求体。
+type renameReq struct {
+	Name string `json:"name"`
+}
+
+// handleRename 修改文件的展示名（前端是双击文件名就地编辑）。
+//
+// 权限与删除完全一致（登录 + 本人或管理员），复用 writableFile：
+// 改名和删除一样，都是「动了别人会看见的东西」，不能因为它是轻量操作
+// 就放松 —— 否则任何人都能把共享盘里的文件名改成任意内容。
+//
+// 为什么是 PATCH 而不是 PUT：这是一次局部更新（只改 name 一个字段）。
+func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
+	f, user, ok := s.writableFile(w, r, "重命名")
+	if !ok {
+		return
+	}
+
+	var req renameReq
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Fail(w, http.StatusBadRequest, "请求内容格式不正确")
+		return
+	}
+
+	// 必须过一遍清洗：名字会被塞进 Content-Disposition 与前端 DOM，
+	// 路径分隔符、控制字符、引号都得在入口处干掉。
+	// 注意 SafeDisplayName 对空串会回退成 "file" —— 空名不报错，
+	// 因为「把名字清空」在语义上等同于「恢复一个兜底的名字」，
+	// 而这种请求几乎只可能来自误操作，给个 file 比报错更省事。
+	name := files.SafeDisplayName(req.Name)
+	if name == f.OriginalName {
+		// 没变化就不写库，省一次 WAL 写入（路由器上的闪光卡寿命有限）。
+		httpx.WriteJSON(w, http.StatusOK, toFileResp(f))
+		return
+	}
+
+	updated, err := s.store.RenameFile(f.ID, name)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			httpx.Fail(w, http.StatusNotFound, "文件不存在")
+			return
+		}
+		s.log.Error("重命名文件失败: id=%d err=%v", f.ID, err)
+		httpx.Fail(w, http.StatusInternalServerError, "重命名失败")
+		return
+	}
+
+	s.log.Info("文件重命名: id=%d %q -> %q user=%s ip=%s",
+		f.ID, f.OriginalName, name, userOrAnon(user), httpx.ClientIP(r))
+
+	httpx.WriteJSON(w, http.StatusOK, toFileResp(updated))
+}
+
+// pinReq 是置顶请求体。指针类型让「没传」与「传了 false」区分开。
+type pinReq struct {
+	Pinned *bool `json:"pinned"`
+}
+
+// handlePin 切换（或显式设置）文件的置顶状态。
+//
+// 权限同样与删除一致：置顶是这块共享盘上的全局顺序，
+// 让任何人都能改等于把列表头变成公共涂鸦墙。
+//
+// 只允许仓库文件：置顶的意义是「常用文件不必往下翻」，
+// 聊天文件随房间一起消亡，给它置顶没有意义（前端也不展示它们）。
+func (s *Server) handlePin(w http.ResponseWriter, r *http.Request) {
+	f, user, ok := s.writableFile(w, r, "置顶")
+	if !ok {
+		return
+	}
+	if f.Kind != storage.KindPermanent {
+		httpx.Fail(w, http.StatusBadRequest, "只有文件仓库中的文件可以置顶")
+		return
+	}
+
+	var req pinReq
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Fail(w, http.StatusBadRequest, "请求内容格式不正确")
+		return
+	}
+	// 不传 pinned 就当作「切换」，这样前端一个按钮就够，
+	// 不用先读当前状态再算目标状态（少一次竞态）。
+	target := !f.Pinned
+	if req.Pinned != nil {
+		target = *req.Pinned
+	}
+
+	updated, err := s.store.SetFilePinned(f.ID, target)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			httpx.Fail(w, http.StatusNotFound, "文件不存在")
+			return
+		}
+		s.log.Error("设置文件置顶失败: id=%d err=%v", f.ID, err)
+		httpx.Fail(w, http.StatusInternalServerError, "设置置顶失败")
+		return
+	}
+
+	s.log.Info("文件置顶变更: id=%d name=%q pinned=%v user=%s ip=%s",
+		f.ID, f.OriginalName, target, userOrAnon(user), httpx.ClientIP(r))
+
+	httpx.WriteJSON(w, http.StatusOK, toFileResp(updated))
+}
+
+// writableFile 取路径里的文件，并校验当前用户是否有权修改它。
+//
+// 从 handleDelete 里抽出来，因为「删除 / 改名 / 置顶」三件事的权限规则
+// 完全一样。规则只有一份，就不会出现「删除收紧了、改名忘了改」这类漏洞。
+//
+// 未通过校验时它自己已经写好响应，调用方直接 return 即可。
+// 返回的 user 可能是 nil（聊天文件无需登录）。
+func (s *Server) writableFile(w http.ResponseWriter, r *http.Request, action string) (*storage.File, *storage.User, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		httpx.Fail(w, http.StatusBadRequest, "非法的文件 ID")
+		return nil, nil, false
+	}
+
+	f, err := s.store.FileByID(id)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			httpx.Fail(w, http.StatusNotFound, "文件不存在")
+			return nil, nil, false
+		}
+		s.log.Error("查询文件失败: id=%d err=%v", id, err)
+		httpx.Fail(w, http.StatusInternalServerError, "读取文件失败")
+		return nil, nil, false
+	}
+
+	var user *storage.User
+	if f.Kind == storage.KindPermanent {
+		user = httpx.CurrentUser(r, s.store)
+		if user == nil {
+			httpx.Fail(w, http.StatusUnauthorized, "请先登录后再"+action+"文件")
+			return nil, nil, false
+		}
+		// 普通用户只能动自己的；管理员放行。
+		if !user.IsAdmin() && !ownsFile(f, user) {
+			httpx.Fail(w, http.StatusForbidden, "只能"+action+"自己上传的文件")
+			return nil, nil, false
+		}
+	} else {
+		user = httpx.CurrentUser(r, s.store)
+	}
+	return f, user, true
 }
 
 // ---------------------------------------------------------------- 工具

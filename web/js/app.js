@@ -1195,6 +1195,8 @@ function renderFiles() {
   list.forEach((f) => {
     const tr = document.createElement('tr');
     tr.dataset.id = f.id;
+    // 置顶行加标记类，由 CSS 给出背景与左侧色条。
+    if (f.pinned) tr.classList.add('is-pinned');
 
     // 文件名 + 类型图标
     const tdName = document.createElement('td');
@@ -1213,7 +1215,22 @@ function renderFiles() {
     nm.className = 'fname';
     nm.title = f.name;
     setText(nm, f.name);
+    // 双击就地改名。只有能改的人（本人或管理员）才挂监听 ——
+    // 挂上去再在回调里判权限，双击时只会看到一个「看着能点、点了报错」的假入口。
+    if (canDeleteFile(f)) {
+      nm.classList.add('is-renamable');
+      nm.addEventListener('dblclick', () => startRename(f, nm, tr));
+    }
     textWrap.appendChild(nm);
+    // 置顶行在文件名后跟一个图钉标记：光靠背景色区分，
+    // 在深色/浅色主题下都容易被当成 hover 态。
+    if (f.pinned) {
+      const pin = document.createElement('span');
+      pin.className = 'fpin';
+      pin.title = '已置顶';
+      pin.innerHTML = PIN_SVG;
+      textWrap.appendChild(pin);
+    }
 
     wrap.append(icon, textWrap);
     tdName.appendChild(wrap);
@@ -1233,7 +1250,7 @@ function renderFiles() {
     tdOwner.className = 'cell-owner';
     setText(tdOwner, f.owner || '—');
 
-    // 操作：下载对所有人开放；删除只给「能删的人」渲染按钮。
+    // 操作：下载对所有人开放；置顶与删除只给「能动的的人」渲染。
     const tdAct = document.createElement('td');
     tdAct.className = 'cell-act';
 
@@ -1249,6 +1266,15 @@ function renderFiles() {
     tdAct.appendChild(dl);
 
     if (canDeleteFile(f)) {
+      const pin = document.createElement('button');
+      pin.className = 'btn btn-icon';
+      if (f.pinned) pin.classList.add('is-active');
+      pin.title = f.pinned ? '取消置顶' : '置顶';
+      pin.setAttribute('aria-label', pin.title + ' ' + f.name);
+      pin.innerHTML = PIN_SVG;
+      pin.addEventListener('click', () => togglePin(f, tr));
+      tdAct.appendChild(pin);
+
       const del = document.createElement('button');
       del.className = 'btn btn-icon is-danger';
       del.title = '删除';
@@ -1262,17 +1288,144 @@ function renderFiles() {
     tr.append(tdName, tdSize, tdTime, tdOwner, tdAct);
     body.appendChild(tr);
   });
+
+  // 置顶顺序由服务端决定，前端不需要在渲染后再做任何对齐/排序补偿。
 }
 
-/** 当前身份能否删掉这个文件。
+/** 图钉图标。表格里的置顶标记与置顶按钮共用一份，避免两处笔画出偏差。 */
+const PIN_SVG = '<svg viewBox="0 0 20 20" width="16" height="16">'
+  + '<path d="M12.6 3.2a1 1 0 011.5.1l2.6 2.6a1 1 0 01-.1 1.5l-1.9 1.5-.4 3.1a.8.8 0 01-1.3.6L10 9.9l-3.4 3.4a.6.6 0 01-.9-.9L9.1 9 6.4 6.3a.8.8 0 01.6-1.3l3.1-.4 1.5-1.9z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>'
+  + '<path d="M5.6 14.4l-1.9 1.9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+
+/** 当前身份能否改/置顶/删这个文件。
  *
- * 与服务端 handleDelete 的规则一一对应，避免给用户点一个必然 403 的按钮。
+ * 与服务端 writableFile 的规则一一对应，避免给用户点一个必然 403 的按钮。
  * 这只是**界面上的礼貌**，真正的闸门在服务端 —— 前端隐藏按钮不算安全措施。
  */
 function canDeleteFile(f) {
   if (!state.user) return false;
   if (state.user.isAdmin) return true;
   return !!f.owner && f.owner === state.user.username;
+}
+
+/** 双击文件名后就地改名。
+ *
+ * 用 input 替换 .fname 的文本，而不是 contenteditable：
+ * contenteditable 会把富文本粘贴带进来（换行、样式片段），
+ * 而文件名是纯文本，还得自己再洗一遍，不如一开始就用 input 干净。
+ *
+ * 提交时机有三个：Enter、失焦、以及「点了别处」——
+ * 其中 Esc 是唯一的中止路径，其余一律当作确认提交。
+ */
+function startRename(f, nm, tr) {
+  // 已经在编辑了（例如双击了两次），别叠出第二个输入框。
+  if (tr.querySelector('.fname-edit')) return;
+
+  const input = document.createElement('input');
+  input.className = 'fname-edit';
+  input.type = 'text';
+  input.value = f.name;
+  input.maxLength = 200;   // 与服务端 SafeDisplayName 的 200 rune 上限对齐
+  input.spellcheck = false;
+
+  let settled = false;
+  const finish = async (commit) => {
+    // Enter 之后浏览器会紧接着触发 blur，两个入口会重复提交一次改名。
+    // 用一个标志位保证只结算一次。
+    if (settled) return;
+    settled = true;
+
+    const next = (input.value || '').trim();
+    input.replaceWith(nm);
+
+    // 没改、或改成了空 —— 都当取消，不发请求。
+    if (!commit || !next || next === f.name) return;
+
+    tr.classList.add('is-busy');
+    try {
+      const res = await fetch('/api/files/' + f.id, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: next }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(data.error || '重命名失败', 'err');
+        tr.classList.remove('is-busy');
+        return;
+      }
+      // 服务端可能对名字做了清洗（去路径、截断），以它返回的为准。
+      f.name = data.name || next;
+      nm.title = f.name;
+      setText(nm, f.name);
+      // 扩展名可能变了，图标要跟着换。
+      const icon = tr.querySelector('.ftype');
+      if (icon) {
+        const ne = extOf(f.name);
+        icon.dataset.t = ne;
+        setText(icon, ne ? ne.slice(0, 4) : 'FILE');
+      }
+      // 下载按钮的 download 属性也要同步，否则存下来的还是旧名字。
+      const dl = tr.querySelector('a.btn-icon');
+      if (dl) {
+        dl.download = f.name;
+        dl.setAttribute('aria-label', '下载 ' + f.name);
+      }
+      tr.classList.remove('is-busy');
+      toast('已重命名为：' + f.name, 'ok');
+    } catch (_) {
+      tr.classList.remove('is-busy');
+      toast('网络错误，重命名失败', 'err');
+    }
+  };
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      finish(false);
+    }
+    // 其余按键不拦，正常输入。
+  });
+  input.addEventListener('blur', () => finish(true));
+
+  nm.replaceWith(input);
+  input.focus();
+  // 光标放在扩展名之前，这样直接打字替换的是主文件名，
+  // 想连扩展名一起改的话按 End 即可 —— 比全选更少误操作。
+  const dot = input.value.lastIndexOf('.');
+  const caret = dot > 0 ? dot : input.value.length;
+  input.setSelectionRange(0, caret);
+}
+
+/** 切换置顶，并用服务端返回的完整列表重排。 */
+async function togglePin(f, tr) {
+  tr.classList.add('is-busy');
+  try {
+    const res = await fetch('/api/files/' + f.id + '/pin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // 不传 pinned，让服务端翻转 —— 前端少算一次，也就没有「按钮上的状态
+      // 和数据库里的状态不一致」导致的翻错方向。
+      body: JSON.stringify({}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast(data.error || '设置置顶失败', 'err');
+      tr.classList.remove('is-busy');
+      return;
+    }
+    toast(data.pinned ? '已置顶：' + data.name : '已取消置顶：' + data.name, 'ok');
+    // 顺序是服务端决定的（pinned DESC, created_at DESC），
+    // 所以直接重新拉一遍，而不是在本地数组里挪位置 —— 后者会和服务端算出的
+    // 顺序有出入（置顶项之间也有先后），久了就变成两套排序逻辑。
+    await loadFiles();
+  } catch (_) {
+    tr.classList.remove('is-busy');
+    toast('网络错误，设置置顶失败', 'err');
+  }
 }
 
 async function deleteFile(f, tr) {

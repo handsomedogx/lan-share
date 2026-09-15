@@ -152,6 +152,16 @@ type Manager struct {
 	mu    sync.RWMutex
 	rooms map[string]*Room
 
+	// retiring 记录「正在回收中」的房间号。
+	//
+	// 存在的理由：复用过期房间号时，必须先同步清完旧房间的资源
+	// （聊天文件、数据库记录），新房间才能变为可见。
+	// 而清理是慢 I/O，不能在持有 m.mu 时做 —— 于是把它拆成
+	// 「摘出 rooms + 标记 retiring」→ 解锁清理 → 重新加锁收尾 三步。
+	// 中间这段窗口里，这个房间号既不在 rooms（对外的 Get 查不到），
+	// 也不该被别人抢去创建，所以需要单独一份集合把它钉住。
+	retiring map[string]struct{}
+
 	// onRoomGone 在房间被回收时回调，参数是被销毁的房间号。
 	//
 	// 用它把「房间消亡」这件事通知给外面，让关联资源（聊天室文件）
@@ -168,19 +178,37 @@ func (m *Manager) SetRoomGoneHandler(fn func(code string)) {
 
 // NewManager 创建会话管理器，并启动房间回收协程。
 func NewManager() *Manager {
-	m := &Manager{rooms: make(map[string]*Room)}
+	m := &Manager{
+		rooms:    make(map[string]*Room),
+		retiring: make(map[string]struct{}),
+	}
 	go m.reapLoop()
 	return m
 }
 
+// newManagerBare 构造一个不带回收协程的管理器，仅供单元测试使用。
+//
+// 测试里换房间/拨时间都是手工驱动的，起一个后台 goroutine 只会让时序不确定。
+func newManagerBare() *Manager {
+	return &Manager{
+		rooms:    make(map[string]*Room),
+		retiring: make(map[string]struct{}),
+	}
+}
+
 // GenerateCode 生成一个未被占用的授权码。
+//
+// 必须同时避开 rooms 与 retiring：落在 retiring 里的房间号正处于
+// 「旧房间已摘除、清理尚未完成」的窗口，此时把同一个码发给新房间，
+// 会让新房间在清理过程中被误伤（按 room_code 清掉新房间刚传的文件）。
 func (m *Manager) GenerateCode() string {
 	for i := 0; i < 100; i++ {
 		code := randomCode()
 		m.mu.RLock()
-		_, exists := m.rooms[code]
+		_, inRooms := m.rooms[code]
+		_, inRetiring := m.retiring[code]
 		m.mu.RUnlock()
-		if !exists {
+		if !inRooms && !inRetiring {
 			return code
 		}
 	}
@@ -204,6 +232,9 @@ func randomCode() string {
 }
 
 // Get 返回房间，不存在返回 nil。已过期的房间视为不存在。
+//
+// 正在回收（retiring）的房间号同样返回 nil：它的资源还没清完，
+// 此时放任何人进来读到上一代房间的数据都是错的。
 func (m *Manager) Get(code string) *Room {
 	m.mu.RLock()
 	r := m.rooms[code]
@@ -218,6 +249,9 @@ func (m *Manager) Get(code string) *Room {
 //
 // 用于区分「从没创建过」（可以自动建）和「已过期」（必须拒绝）：
 // 若不区分，过期房间会被下一个连接无限续命，存活时长就失去意义。
+//
+// 只在它仍留在 rooms 表里时返回 true —— 正在回收中的房间号已经摘出表外，
+// 对外表现为「不存在」，交给 CreateWithCode 走完整的复用流程。
 func (m *Manager) ExistsButExpired(code string) bool {
 	m.mu.RLock()
 	r := m.rooms[code]
@@ -237,6 +271,20 @@ func (m *Manager) Create(ttlMinutes int) (*Room, error) {
 //
 // ttlMinutes 为 0（或非白名单值）时房间**没有**到期时间 ——
 // 调用方应先用 ValidTTL 拦掉，避免造出永不回收的房间。
+//
+// 复用过期房间号时，关键原则是：
+//
+//	旧房间的清理必须**完成后**，新同名房间才能变为可见。
+//
+// 聊天文件的归属只记 room_code，如果直接 delete 房间再异步清理，
+// 就会出现「新房间已经上传了文件，旧房间的异步清理按同一个 room_code
+// 把新文件也删掉」的串代事故。所以这里刻意分三段执行：
+//
+//	① 持锁：摘除旧房间 + 标记 retiring，然后**解锁**
+//	② 锁外：同步执行 notifyGone，把旧房间的聊天文件清干净
+//	③ 重新持锁：清掉 retiring 标记，创建新房间
+//
+// 慢 I/O（SQLite、unlink）一律在锁外做，否则会拖住所有房间的操作。
 func (m *Manager) CreateWithCode(code string, ttlMinutes int) (*Room, error) {
 	if code == "" {
 		code = m.GenerateCode()
@@ -244,16 +292,49 @@ func (m *Manager) CreateWithCode(code string, ttlMinutes int) (*Room, error) {
 		return nil, err
 	}
 
+	// ---- ① 摘除过期房间并占住这个代码 ----
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+	if _, busy := m.retiring[code]; busy {
+		// 另一个请求正在回收这个房间号。清理没结束前不能放任何新房间进来。
+		m.mu.Unlock()
+		return nil, ErrCodeTaken
+	}
 
+	needRetire := false
 	if old, ok := m.rooms[code]; ok {
-		// 同名房间还在且没过期 —— 真正的冲突。
 		if !old.Expired() {
+			// 同名房间还在且没过期 —— 真正的冲突。
+			m.mu.Unlock()
 			return nil, ErrCodeTaken
 		}
-		// 已过期：直接顶掉，让用户能复用刚被回收的名字。
+		// 已过期：先摘出 rooms，再标记 retiring，
+		// 让随后到来的同名创建请求看到「占用中」而不是「不存在」。
 		delete(m.rooms, code)
+		m.retiring[code] = struct{}{}
+		needRetire = true
+	}
+	m.mu.Unlock()
+
+	// ---- ② 锁外同步清理旧房间资源 ----
+	if needRetire {
+		m.notifyGone(code)
+
+		m.mu.Lock()
+		delete(m.retiring, code)
+		m.mu.Unlock()
+	}
+
+	// ---- ③ 收尾并创建 ----
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+
+	// 清理期间可能有别的 goroutine 抢先建出了同名房间
+	// （比如 WS 的「带码直达」自动建房间）。这里复查一次，
+	// 保证同一个房间号不会同时存在两个房间。
+	if _, ok := m.rooms[code]; ok {
+		return nil, ErrCodeTaken
 	}
 
 	now := time.Now()
@@ -284,6 +365,24 @@ func (m *Manager) Stats() (rooms, clients int) {
 	return
 }
 
+// ensureMapsLocked 保证 rooms / retiring 两张表可用。
+//
+// 调用者必须已持有 m.mu（写锁）。
+//
+// 为什么需要它：Manager 既可能由 NewManager 构造，也可能在代码或测试里
+// 直接用结构体字面量建出来（历史上的测试都这么写）。字面量不会初始化
+// retiring，而向 nil map 写入会直接 panic。与其要求每个构造点都记得
+// 填上这个内部字段，不如在使用点兜一层 —— 这类「忘记初始化就崩」
+// 的隐式契约正是最容易在重构中被破坏的东西。
+func (m *Manager) ensureMapsLocked() {
+	if m.rooms == nil {
+		m.rooms = make(map[string]*Room)
+	}
+	if m.retiring == nil {
+		m.retiring = make(map[string]struct{})
+	}
+}
+
 // reapLoop 定期回收房间：
 //   - 设了存活时长的，到点即删（无论有没人）。
 //   - 没有到期时间的（零值，正常路径下不该出现），空闲超过
@@ -303,11 +402,20 @@ func (m *Manager) reapLoop() {
 //
 // 回调在**释放锁之后**才触发：删房间要顺带删磁盘文件，
 // 那是慢 I/O，握着全局锁做会拖住所有房间的操作。
+//
+// 摘除房间时同样标记 retiring：这样「后台回收」与「复用同名房间号」
+// 两条路径不会同时清理同一个 room_code，也就不会出现
+// 「后台回收跑到一半，新同名房间已经建好并上传了文件」的串代窗口。
 func (m *Manager) reapOnce(now time.Time) {
 	var gone []string
 
 	m.mu.Lock()
+	m.ensureMapsLocked()
 	for code, r := range m.rooms {
+		if _, busy := m.retiring[code]; busy {
+			continue
+		}
+
 		r.mu.RLock()
 		empty := len(r.clients) == 0
 		last := r.lastSeen
@@ -317,9 +425,11 @@ func (m *Manager) reapOnce(now time.Time) {
 		switch {
 		case !exp.IsZero() && now.After(exp):
 			delete(m.rooms, code)
+			m.retiring[code] = struct{}{}
 			gone = append(gone, code)
 		case exp.IsZero() && empty && now.Sub(last) > roomIdleTimeout:
 			delete(m.rooms, code)
+			m.retiring[code] = struct{}{}
 			gone = append(gone, code)
 		}
 	}
@@ -327,6 +437,10 @@ func (m *Manager) reapOnce(now time.Time) {
 
 	for _, code := range gone {
 		m.notifyGone(code)
+
+		m.mu.Lock()
+		delete(m.retiring, code)
+		m.mu.Unlock()
 	}
 }
 
@@ -339,6 +453,10 @@ func (m *Manager) notifyGone(code string) {
 
 // ActiveCodes 返回当前所有活跃房间号。
 // 清理协程用它和数据库里的聊天文件做差集，找出无主文件。
+//
+// 刻意**不含** retiring 中的房间号：那些房间的资源正在被删，
+// 它们的聊天文件本来就该被清掉，不该被当成「活跃房间」保下来。
+// 若把它们算进去，孤儿清理会一直认为这些文件有主，反而漏删。
 func (m *Manager) ActiveCodes() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -347,6 +465,14 @@ func (m *Manager) ActiveCodes() []string {
 		out = append(out, code)
 	}
 	return out
+}
+
+// isRetiring 判断某个房间号是否正在回收中。仅供测试与排查使用。
+func (m *Manager) isRetiring(code string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.retiring[code]
+	return ok
 }
 
 // ---------------------------------------------------------------- Room

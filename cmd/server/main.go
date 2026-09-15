@@ -135,7 +135,9 @@ func run() error {
 		return nil
 	}
 
-	fileSvc, err := files.New(cfg.FilesRoot, cfg.MaxUploadBytes)
+	// 上传上限不再绑在 files.Service 上：每次 Save 由调用方显式传入，
+	// 文件仓库与聊天室各用各的上限，不会互相覆盖（见 files.Service 的注释）。
+	fileSvc, err := files.New(cfg.FilesRoot)
 	if err != nil {
 		return err
 	}
@@ -162,7 +164,6 @@ func run() error {
 		WebFS:         static,
 		SessionTTL:    cfg.SessionTTL,
 		MaxUpload:     cfg.MaxUploadBytes,
-		TempFileTTL:   cfg.TempFileDefaultTTL,
 		ChatMaxUpload: cfg.ChatMaxUploadBytes,
 
 		UploadConcurrency: cfg.UploadConcurrency,

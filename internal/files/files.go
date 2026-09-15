@@ -33,20 +33,34 @@ var ErrNoSpace = errors.New("磁盘空间不足")
 const reservedSpaceRatio = 0.05
 
 // Service 提供文件落盘能力。
+//
+// 这里刻意**不保存**一个全局的单文件上限。
+//
+// 早期版本把 maxBytes 绑在 Service 上，导致文件仓库的上限会顺着
+// files.Save 悄悄作用到聊天室上传上 —— 环境变量里写着聊天室 100MB，
+// 实际到仓库的 50MB 就被截断了，是个很难发现的隐藏耦合。
+//
+// 现在上限是每次 Save 的显式参数，两条链路各传各的，互不影响。
 type Service struct {
-	root     string // 文件仓库根目录
-	maxBytes int64  // 单文件上限，0 表示不限制
+	root string // 文件仓库根目录
 }
 
 // New 创建文件服务，并确保各分类子目录存在。
-func New(root string, maxBytes int64) (*Service, error) {
-	for _, sub := range []string{"permanent", "temporary", "chat"} {
+func New(root string) (*Service, error) {
+	for _, sub := range kindDirs {
 		if err := os.MkdirAll(filepath.Join(root, sub), 0o755); err != nil {
 			return nil, fmt.Errorf("创建文件目录失败: %w", err)
 		}
 	}
-	return &Service{root: root, maxBytes: maxBytes}, nil
+	return &Service{root: root}, nil
 }
+
+// kindDirs 是全部文件分类子目录，单一事实来源。
+//
+// 建目录、清理残留 .part 都从这里取，避免两处白名单各自维护、某天漏改一处。
+// 历史上还有 "temporary"（按 expires_at 到期自动删），UI 改用纯永久仓库后
+// 该类型已被整体移除，这里同步去掉。
+var kindDirs = []string{"permanent", "chat"}
 
 // Dir 返回某类型的存放目录。
 //
@@ -54,8 +68,6 @@ func New(root string, maxBytes int64) (*Service, error) {
 // 虽然调用方目前只传 storage 包里的常量，但这里不留下任何拼接隐患。
 func (s *Service) Dir(kind string) string {
 	switch kind {
-	case "temporary":
-		return filepath.Join(s.root, "temporary")
 	case "chat":
 		return filepath.Join(s.root, "chat")
 	default:
@@ -72,9 +84,17 @@ type SaveResult struct {
 
 // Save 把 r 的内容写入指定类型的目录，同时计算大小与 SHA256。
 //
+// maxBytes 是**本次**调用的单文件上限，0 表示不限制。由调用方显式传入，
+// 这样文件仓库与聊天室可以各用各的上限，不会再互相覆盖。
+//
+// 为什么有了 http.MaxBytesReader 还要在这里再限一次：
+// MaxBytesReader 限的是整个 multipart **请求体**，它比文件内容多出
+// boundary 与 part header 的开销（见 openUploadStream 的 multipartOverhead），
+// 属于「请求总量保护」。这里限的是真实文件字节数，是精确的最后一层闸门。
+//
 // 采用「先写 .part 临时文件，成功后 rename」的方式：
 // 这样即使写到一半进程被杀，也不会在仓库里留下一个看似完整、实际损坏的文件。
-func (s *Service) Save(kind string, r io.Reader) (*SaveResult, error) {
+func (s *Service) Save(kind string, r io.Reader, maxBytes int64) (*SaveResult, error) {
 	dir := s.Dir(kind)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -104,9 +124,9 @@ func (s *Service) Save(kind string, r io.Reader) (*SaveResult, error) {
 	hasher := sha256.New()
 	var reader io.Reader = r
 
-	if s.maxBytes > 0 {
+	if maxBytes > 0 {
 		// 多读 1 字节用于判断是否超限。
-		reader = io.LimitReader(r, s.maxBytes+1)
+		reader = io.LimitReader(r, maxBytes+1)
 	}
 
 	// io.Copy 出错时返回的 n 是「中断前已写入多少」，这是区分故障类型的
@@ -115,7 +135,7 @@ func (s *Service) Save(kind string, r io.Reader) (*SaveResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("写入文件失败（已接收 %s）: %w", HumanSize(n), err)
 	}
-	if s.maxBytes > 0 && n > s.maxBytes {
+	if maxBytes > 0 && n > maxBytes {
 		err = ErrTooLarge
 		return nil, err
 	}
@@ -185,7 +205,7 @@ func (s *Service) PurgeStaleParts() (int, int64, error) {
 
 	var count int
 	var freed int64
-	for _, kind := range []string{"permanent", "temporary", "chat"} {
+	for _, kind := range kindDirs {
 		dir := s.Dir(kind)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -221,6 +241,24 @@ func (s *Service) Open(kind, storedName string) (*os.File, error) {
 		return nil, errors.New("非法的存储文件名")
 	}
 	return os.Open(filepath.Join(s.Dir(kind), storedName))
+}
+
+// Exists 判断某个存储名在磁盘上是否真实存在。
+//
+// 为什么需要它：数据库里可能有指向不存在的磁盘文件的记录
+// （管理员手工删过、文件系统异常、外部脚本误删，或历史 bug 留下的
+// 「有记录没文件」）。去重时若不先确认，就会把刚上传成功的好文件
+// 删掉、转而引用那个根本不存在的旧存储名，最终产出一条永远下载
+// 失败的坏记录。
+//
+// 非法存储名一律返回 false —— 与其去 stat 一个可疑路径，不如直接
+// 当作「不存在」，让调用方保留自己刚写下的那份好文件。
+func (s *Service) Exists(kind, storedName string) bool {
+	if !isSafeName(storedName) {
+		return false
+	}
+	st, err := os.Stat(filepath.Join(s.Dir(kind), storedName))
+	return err == nil && !st.IsDir()
 }
 
 // Remove 删除一个已存储的文件。文件不存在视为成功（幂等）。

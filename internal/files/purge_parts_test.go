@@ -8,7 +8,7 @@ import (
 )
 
 func TestPurgeStaleParts(t *testing.T) {
-	svc, err := New(t.TempDir(), 0)
+	svc, err := New(t.TempDir())
 	if err != nil {
 		t.Fatalf("创建文件服务失败: %v", err)
 	}

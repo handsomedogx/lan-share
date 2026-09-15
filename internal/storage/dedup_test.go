@@ -121,8 +121,8 @@ func TestFileBySHA256ScopedToOwner(t *testing.T) {
 
 // TestFileBySHA256ScopedToKind 验证去重只在同类文件内发生。
 //
-// 这条很关键：chat / temporary 的删磁盘逻辑是「记录没了就 unlink」，
-// 一旦跨类型复用了存储名，一方过期就会把另一方的文件删掉。
+// 这条很关键：chat 的删磁盘逻辑是「记录没了就 unlink」，
+// 一旦跨类型复用了存储名，一方消亡就会把另一方的文件删掉。
 func TestFileBySHA256ScopedToKind(t *testing.T) {
 	s := newTestStore(t)
 
@@ -190,5 +190,86 @@ func TestCountFilesBySHA256(t *testing.T) {
 	}
 	if n, err = s.CountFilesBySHA256(sha, KindPermanent, uid); err != nil || n != 0 {
 		t.Fatalf("全部删除后引用应归零，得到 %d (err=%v)", n, err)
+	}
+}
+
+// TestCountFilesByStoredName 验证「按磁盘对象名」的引用计数 ——
+// 这是删除时真正决定要不要 unlink 的那个口径。
+//
+// 与 CountFilesBySHA256 的关键差别：那个口径把引用数限定在
+// 「同一内容 + 同一类型 + 同一上传者」这个三元组上，而磁盘上被删的
+// 物理对象是 stored_name。问「还有没有记录指向它」才是最直接、最不会漏判的。
+func TestCountFilesByStoredName(t *testing.T) {
+	s := newTestStore(t)
+
+	alice := mkUser(t, s, "alice")
+	bob := mkUser(t, s, "bob")
+
+	const stored = "shared-physical.bin"
+
+	// 两条记录共享同一个磁盘对象（不同上传者、不同原始文件名）。
+	first := mkPermanent(t, s, "alice-report.pdf", stored, "hash-a", alice)
+	second := mkPermanent(t, s, "bob-copy.pdf", stored, "hash-b", bob)
+
+	if n, err := s.CountFilesByStoredName(stored); err != nil || n != 2 {
+		t.Fatalf("共享存储名应有 2 条引用，得到 %d (err=%v)", n, err)
+	}
+
+	// 删掉第一条：物理文件仍被第二条引用，计数必须是 1，不能 unlink。
+	if err := s.DeleteFileRecord(first); err != nil {
+		t.Fatalf("删除记录失败: %v", err)
+	}
+	if n, err := s.CountFilesByStoredName(stored); err != nil || n != 1 {
+		t.Fatalf("删一条后应剩 1 条引用，得到 %d (err=%v)", n, err)
+	}
+
+	// 删掉最后一条：计数归零，这时才允许删磁盘文件。
+	if err := s.DeleteFileRecord(second); err != nil {
+		t.Fatalf("删除记录失败: %v", err)
+	}
+	if n, err := s.CountFilesByStoredName(stored); err != nil || n != 0 {
+		t.Fatalf("全部删除后引用应归零，得到 %d (err=%v)", n, err)
+	}
+
+	// 不存在的存储名应当返回 0 而不是报错 —— 调用方据此安全地走删除分支。
+	if n, err := s.CountFilesByStoredName("never-existed.bin"); err != nil || n != 0 {
+		t.Fatalf("不存在的存储名应返回 0，得到 %d (err=%v)", n, err)
+	}
+}
+
+// TestCountFilesByStoredNameIgnoresKindAndOwner 验证按存储名计数时
+// **不**附加 kind / owner 条件。
+//
+// 理由：这条查询要回答的是「磁盘上这个文件还有没有人引用」，
+// 与引用它的记录属于谁、是什么类型无关。放宽条件只可能更安全
+// （多留一个孤儿文件）而不会更危险（误删别人的数据）。
+func TestCountFilesByStoredNameIgnoresKindAndOwner(t *testing.T) {
+	s := newTestStore(t)
+
+	alice := mkUser(t, s, "alice")
+
+	const stored = "cross-kind.bin"
+	mkPermanent(t, s, "repo.bin", stored, "h1", alice)
+
+	// 手工插一条 owner_id 为 NULL 的记录指向同一个存储名。
+	// 去重查询（要求 owner 相等）永远命中不到它，但它是真实存在的引用，
+	// 按存储名计数必须把它算进去。
+	if _, err := s.db.Exec(
+		`INSERT INTO files (original_name, stored_name, size, sha256, kind, owner_name, created_at)
+		 VALUES ('orphan.bin', ?, 4, 'h2', 'permanent', '', 1000)`, stored); err != nil {
+		t.Fatalf("插入无主记录失败: %v", err)
+	}
+
+	n, err := s.CountFilesByStoredName(stored)
+	if err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("无主记录也应计入引用，期望 2 得到 %d", n)
+	}
+
+	// 对照：按 sha256 + owner 的旧口径只认 alice 那一条。
+	if n2, err := s.CountFilesBySHA256("h1", KindPermanent, alice); err != nil || n2 != 1 {
+		t.Fatalf("旧口径应只统计到 1 条，得到 %d (err=%v)", n2, err)
 	}
 }

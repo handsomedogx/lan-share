@@ -227,6 +227,10 @@ button, input, textarea { font: inherit; color: inherit; }
 }
 .btn-icon:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
 .btn-icon.is-danger:hover:not(:disabled) { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+/* 置顶按钮的「已置顶」态：不用实心填充，只在悬停背景之上再加一点强调色，
+   这样和旁边偶尔的 hover 态仍能一眼区分开。 */
+.btn-icon.is-active { color: var(--accent); }
+.btn-icon.is-active:hover:not(:disabled) { color: var(--accent-strong); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 
 /* ---------------------------------------------------------------- 输入 */
 .input {
@@ -663,7 +667,14 @@ button, input, textarea { font: inherit; color: inherit; }
   position: relative;
 }
 
-.file-table { width: 100%; border-collapse: separate; border-spacing: 0; }
+/* 表头 sticky 的前提：祖先不能有 overflow: hidden/auto 截断它。
+   .file-scroll 本身就是滚动容器，故这里只做宽度约束。 */
+.file-table-wrap { min-width: 0; }
+
+/* table-layout: fixed + <colgroup> 定宽，长文件名不会再挤压别的列。
+   第 1 列（文件名）刻意不设宽度：其余四列固定后，剩下的全归它，
+   正好让文件名拿到最多的横向空间。 */
+.file-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; }
 .file-table thead th {
   position: sticky;
   top: 0;
@@ -678,22 +689,42 @@ button, input, textarea { font: inherit; color: inherit; }
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
+/* 操作列现在最多放三个按钮（下载 / 置顶 / 删除），
+   28px × 3 + 两个 4px 间距 + 两侧 padding，116px 刚好不换行。
+   再窄下去按钮会竖向堆叠，行高就跟着变了。 */
 .col-size { width: 92px; }
 .col-time { width: 120px; }
 .col-owner { width: 100px; }
-.col-act { width: 76px; }
+.col-act { width: 116px; }
 
 .file-table tbody td {
   padding: 9px 14px;
   border-bottom: 1px solid var(--border);
   font-size: 13px;
   vertical-align: middle;
+  /* fixed 布局下不加这句，超长内容会撑破单元格（尤其改名编辑框）。 */
+  overflow: hidden;
 }
 .file-table tbody tr { transition: background .12s; }
 .file-table tbody tr:hover { background: var(--surface-2); }
 .file-table tbody tr.is-busy { opacity: .5; pointer-events: none; }
 
+/* 置顶行：底色 + 左侧强调条。
+   样式挂在 td 上而不是 tr 上 —— 背景画在 tr 上会被 td 的背景盖住，
+   而 td 又有 border-bottom，跨行的 ::before 不好定位。 */
+.file-table tbody tr.is-pinned td { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.file-table tbody tr.is-pinned:hover td { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.file-table tbody tr.is-pinned td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+
 .cell-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
+
+/* 文件名 + 置顶标记。
+   置顶图钉放在 .fname 之后，而 .fname 是 ellipsis 省略的 —— 若让二者同处
+   一行 flex，长文件名会把图钉挤出可视区。所以这层用 flex + min-width: 0，
+   让 .fname 自己收缩省略，图钉 flex-shrink: 0 永远留在原地。 */
+.cell-name > div { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.fname { flex: 0 1 auto; }
+.fpin { flex: 0 0 auto; display: inline-flex; color: var(--accent); opacity: .85; }
 
 .ftype {
   flex: 0 0 auto;
@@ -727,6 +758,34 @@ button, input, textarea { font: inherit; color: inherit; }
   min-width: 0;
 }
 .fmeta { font-size: 11px; color: var(--text-3); margin-top: 1px; }
+
+/* 可改名的文件名：悬停时加一条虚线下划线当作提示。
+   没有这条线，双击改名这个能力就没有任何可见入口 —— 用户不会去双击试试。 */
+.fname.is-renamable { cursor: text; }
+.fname.is-renamable:hover {
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--border-strong);
+}
+
+/* 就地改名的输入框。
+   必须给足宽度，否则 input 会退化成默认 20 字符宽，比原文件名窄一截，
+   编辑时视觉上是「跳一下」。用 % 撑满可用的单元格宽度。 */
+.fname-edit {
+  width: 100%;
+  max-width: 100%;
+  height: 26px;
+  padding: 0 8px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-xs);
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
+}
 
 .cell-size, .cell-time { color: var(--text-2); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .cell-owner { color: var(--text-3); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

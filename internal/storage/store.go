@@ -111,10 +111,11 @@ CREATE TABLE IF NOT EXISTS files (
     owner_name   TEXT    NOT NULL DEFAULT '',
     room_code    TEXT    NOT NULL DEFAULT '',
     created_at   INTEGER NOT NULL,
-    expires_at   INTEGER
+    -- 置顶：0 普通，1 置顶。用整数而不是布尔，是因为 SQLite 的布尔本身就是
+    -- INTEGER 的别名，直接存 0/1 更省事，也能在 ORDER BY 里直接参与排序。
+    pinned       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_files_kind ON files(kind, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_files_expires ON files(expires_at);
 -- 注意：idx_files_room 不在这里建。
 -- 老库的 files 表没有 room_code 列，而这一段 schema 会在「补列」之前执行，
 -- 直接 CREATE INDEX 会报 "no such column: room_code" 并中断整个迁移。
@@ -177,6 +178,11 @@ CREATE TABLE IF NOT EXISTS settings (
 		return fmt.Errorf("为文件表创建内容哈希索引失败: %w", err)
 	}
 
+	// 增量升级：老库的 files 表没有 pinned 列（置顶是后加的能力）。
+	if err := s.ensureFilePinnedColumn(); err != nil {
+		return err
+	}
+
 	// 增量升级：拆掉 stored_name 上的 UNIQUE 约束。
 	//
 	// 第一版把 stored_name 声明成 UNIQUE（一条记录一个磁盘文件），
@@ -187,6 +193,17 @@ CREATE TABLE IF NOT EXISTS settings (
 	// 标准做法，且整体包在事务里 —— 中途失败必须完整回滚，绝不能留下
 	// 一张缺数据的 files 表（那是用户真实的文件元数据）。
 	if err := s.dropStoredNameUnique(); err != nil {
+		return err
+	}
+
+	// 补列兜底：极老的库（stored_name 仍带 UNIQUE）会在上面那次重建里
+	// 按 files_new 的列定义重建，pinned 那时就已经在了；但为了不让
+	// 「补列」依赖「重建」这个副作用，这里再确认一次并在缺列时补上。
+	// columnExists 是幂等的，重复调用没有代价。
+	//
+	// 顺序也说得通：重建在先、补列在后，无论从哪条路径进来，
+	// 出了 migrate 的 files 表一定同时具备 latest schema 的全部列。
+	if err := s.ensureFilePinnedColumn(); err != nil {
 		return err
 	}
 
@@ -202,6 +219,92 @@ CREATE TABLE IF NOT EXISTS settings (
 		return fmt.Errorf("回填文件内容哈希失败: %w", err)
 	}
 
+	// 增量升级：移除已废弃的 expires_at 列（temporary 文件类型的遗迹）。
+	//
+	// 放在最后执行，因为它要重建表：上面几步（补 pinned、拆 UNIQUE、回填 sha256）
+	// 都建立在「表结构仍含 expires_at」的基础上，顺序颠倒会让它们读到不同的列集。
+	// 拆除后 files 表的列定义与 schema 中的定义完全一致。
+	if err := s.dropExpiresAtColumn(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// dropExpiresAtColumn 若 files 表仍有 expires_at 列，则重建表去掉它。
+//
+// 背景：temporary 类型按 expires_at 到期自动删除，该类型已被整体移除，
+// 这一列再没有任何读写方，留着只是 schema 噪音与维护负担。
+//
+// SQLite 不支持 DROP COLUMN 的历史较早，这里沿用与 dropStoredNameUnique
+// 相同的「12 步 alter」重建法，整体包在事务里 —— files 是用户真实的文件
+// 元数据，中途失败必须完整回滚。
+//
+// 幂等：列不存在时直接返回。这也让本方法天然成为「重建路径的兜底」——
+// 重建 SQL 本就不含 expires_at，因此极老的库经由 dropStoredNameUnique
+// 重建后，这里会因列已消失而空跑。
+//
+// 注意一个刻意的取舍：**这一步不判断"列里有没有非空数据"**。
+// expires_at 若有值，其含义是「这个临时文件何时该被删」——而 temporary
+// 类型已不被写入，残留值只可能来自早已失效的历史数据；此时正确的动作是
+// 保留文件本体、丢弃这个已无意义的过期标记，而不是为了保住一列死数据
+// 就让整个 schema 永远背着一个废弃字段。
+func (s *Store) dropExpiresAtColumn() error {
+	has, err := s.columnExists("files", "expires_at")
+	if err != nil {
+		return err
+	}
+	if !has {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("开启迁移事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmts := []string{
+		`CREATE TABLE files_new (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			original_name TEXT    NOT NULL,
+			stored_name   TEXT    NOT NULL,
+			size          INTEGER NOT NULL,
+			sha256        TEXT    NOT NULL DEFAULT '',
+			kind          TEXT    NOT NULL DEFAULT 'permanent',
+			owner_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			owner_name    TEXT    NOT NULL DEFAULT '',
+			room_code     TEXT    NOT NULL DEFAULT '',
+			created_at    INTEGER NOT NULL,
+			pinned        INTEGER NOT NULL DEFAULT 0
+		)`,
+		`INSERT INTO files_new (id, original_name, stored_name, size, sha256, kind,
+		                        owner_id, owner_name, room_code, created_at, pinned)
+		 SELECT id, original_name, stored_name, size, sha256, kind,
+		        owner_id, owner_name, room_code, created_at, pinned FROM files`,
+		`DROP TABLE files`,
+		`ALTER TABLE files_new RENAME TO files`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.Exec(q); err != nil {
+			return fmt.Errorf("移除 files.expires_at 失败: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交 files 表重建失败: %w", err)
+	}
+
+	// DROP TABLE 会连带删掉原表上的索引，索引必须重建。
+	idxs := []string{
+		`CREATE INDEX IF NOT EXISTS idx_files_kind ON files(kind, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_files_room ON files(room_code)`,
+		`CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256, kind, owner_id)`,
+	}
+	for _, q := range idxs {
+		if _, err := s.db.Exec(q); err != nil {
+			return fmt.Errorf("重建 files 索引失败: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -241,12 +344,12 @@ func (s *Store) dropStoredNameUnique() error {
 			owner_name    TEXT    NOT NULL DEFAULT '',
 			room_code     TEXT    NOT NULL DEFAULT '',
 			created_at    INTEGER NOT NULL,
-			expires_at    INTEGER
+			pinned        INTEGER NOT NULL DEFAULT 0
 		)`,
 		`INSERT INTO files_new (id, original_name, stored_name, size, sha256, kind,
-		                        owner_id, owner_name, room_code, created_at, expires_at)
+		                        owner_id, owner_name, room_code, created_at, pinned)
 		 SELECT id, original_name, stored_name, size, sha256, kind,
-		        owner_id, owner_name, room_code, created_at, expires_at FROM files`,
+		        owner_id, owner_name, room_code, created_at, pinned FROM files`,
 		`DROP TABLE files`,
 		`ALTER TABLE files_new RENAME TO files`,
 	}
@@ -263,7 +366,6 @@ func (s *Store) dropStoredNameUnique() error {
 	// idx_files_sha 由调用方在这之后重新创建（顺序见 migrate）。
 	idxs := []string{
 		`CREATE INDEX IF NOT EXISTS idx_files_kind ON files(kind, created_at DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_files_expires ON files(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_files_room ON files(room_code)`,
 		`CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256, kind, owner_id)`,
 	}
@@ -271,6 +373,26 @@ func (s *Store) dropStoredNameUnique() error {
 		if _, err := s.db.Exec(q); err != nil {
 			return fmt.Errorf("重建 files 索引失败: %w", err)
 		}
+	}
+	return nil
+}
+
+// ensureFilePinnedColumn 保证 files 表有 pinned 列，缺则补。幂等。
+//
+// 单独抽出来是为了让 migrate 的调用顺序更好读：它被用在两个位置 ——
+// 重建表之前（新库/普通老库的常规补列）与之后（重建路径的兜底），
+// 两处都只是在回答「这一列到底有没有」。
+func (s *Store) ensureFilePinnedColumn() error {
+	has, err := s.columnExists("files", "pinned")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	if _, err := s.db.Exec(
+		`ALTER TABLE files ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("为文件表添加 pinned 列失败: %w", err)
 	}
 	return nil
 }
@@ -560,15 +682,15 @@ type FileKind string
 
 const (
 	// KindPermanent 是长期文件仓库中的文件，不会自动删除。
+	//
+	// 这是文件仓库唯一的类型。历史上还存在过 temporary（按时间过期），
+	// 但 UI 早已只用 permanent，那套按 expires_at 回收的逻辑已成纯负债，
+	// 因此被整体移除（连同 files.expires_at 列）。
 	KindPermanent FileKind = "permanent"
-	// KindTemporary 是临时文件，按时长到期后自动删除（当前 UI 不再写入，
-	// 保留读写能力是为了兼容既有数据与直连 API 的调用方）。
-	KindTemporary FileKind = "temporary"
 	// KindChat 是随房间一起消亡的聊天室文件。
 	//
-	// 与 temporary 的关键区别：temporary 按**时间**过期，chat 按**房间**存亡 ——
-	// 房间被销毁（到点/空闲回收）时，其下所有文件立即删除，
-	// 这样「房间到期即自动删除」这件事对文件也成立。
+	// 生命周期按**房间**存亡：房间被销毁（到点/空闲回收）时，
+	// 其下所有文件立即删除，这样「房间到期即自动删除」这件事对文件也成立。
 	KindChat FileKind = "chat"
 )
 
@@ -586,7 +708,11 @@ type File struct {
 	// 房间销毁时按它找出所有关联文件一并删除。
 	RoomCode  string
 	CreatedAt time.Time
-	ExpiresAt *time.Time
+	// Pinned 表示该文件在仓库里被置顶。
+	//
+	// 只有永久文件会用到它：置顶解决的是「常用的那几个文件每次都要往下翻」，
+	// 而聊天文件本身就是短命的，置顶没有意义（接口层也只能操作永久文件）。
+	Pinned bool
 }
 
 // CreateFile 写入文件元数据。
@@ -595,16 +721,12 @@ func (s *Store) CreateFile(f *File) (int64, error) {
 	if f.OwnerID != nil {
 		owner = *f.OwnerID
 	}
-	var expires any
-	if f.ExpiresAt != nil {
-		expires = f.ExpiresAt.Unix()
-	}
 
 	res, err := s.db.Exec(`
-		INSERT INTO files (original_name, stored_name, size, sha256, kind, owner_id, owner_name, room_code, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO files (original_name, stored_name, size, sha256, kind, owner_id, owner_name, room_code, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		f.OriginalName, f.StoredName, f.Size, f.SHA256, string(f.Kind),
-		owner, f.OwnerName, f.RoomCode, f.CreatedAt.Unix(), expires,
+		owner, f.OwnerName, f.RoomCode, f.CreatedAt.Unix(),
 	)
 	if err != nil {
 		return 0, err
@@ -612,17 +734,17 @@ func (s *Store) CreateFile(f *File) (int64, error) {
 	return res.LastInsertId()
 }
 
-const fileCols = `id, original_name, stored_name, size, sha256, kind, owner_id, owner_name, room_code, created_at, expires_at`
+const fileCols = `id, original_name, stored_name, size, sha256, kind, owner_id, owner_name, room_code, created_at, pinned`
 
 func scanFile(sc interface{ Scan(...any) error }) (*File, error) {
 	var f File
 	var kind string
 	var owner sql.NullInt64
 	var created int64
-	var expires sql.NullInt64
+	var pinned int64
 
 	if err := sc.Scan(&f.ID, &f.OriginalName, &f.StoredName, &f.Size, &f.SHA256,
-		&kind, &owner, &f.OwnerName, &f.RoomCode, &created, &expires); err != nil {
+		&kind, &owner, &f.OwnerName, &f.RoomCode, &created, &pinned); err != nil {
 		return nil, err
 	}
 	f.Kind = FileKind(kind)
@@ -631,17 +753,19 @@ func scanFile(sc interface{ Scan(...any) error }) (*File, error) {
 		f.OwnerID = &v
 	}
 	f.CreatedAt = time.Unix(created, 0)
-	if expires.Valid {
-		t := time.Unix(expires.Int64, 0)
-		f.ExpiresAt = &t
-	}
+	f.Pinned = pinned != 0
 	return &f, nil
 }
 
-// ListFiles 按类型列出文件，最新在前。
+// ListFiles 按类型列出文件：置顶的最前，其余按上传时间从新到旧。
+//
+// 排序必须在服务端做：仓库是多人共用的共享盘，置顶是「这块盘上的共识」，
+// 只有落在一个地方排序，所有客户端（含直连 API 的）看到的顺序才一致。
+// 前端再排一次只会把这件事变成两处需要同步维护的逻辑。
 func (s *Store) ListFiles(kind FileKind) ([]*File, error) {
 	rows, err := s.db.Query(
-		`SELECT `+fileCols+` FROM files WHERE kind = ? ORDER BY created_at DESC, id DESC`,
+		`SELECT `+fileCols+` FROM files WHERE kind = ?
+		 ORDER BY pinned DESC, created_at DESC, id DESC`,
 		string(kind),
 	)
 	if err != nil {
@@ -761,12 +885,34 @@ func (s *Store) FileBySHA256(sha string, kind FileKind, ownerID int64) (*File, e
 
 // CountFilesBySHA256 统计某条内容哈希被多少条记录引用（限定类型与上传者）。
 //
-// 删除时用它判断「磁盘上那个文件还有没有人用」：返回值 <= 1 才允许 unlink。
+// 注意：删除路径**不再**用它决定要不要 unlink，改用 CountFilesByStoredName。
+// 原因是它统计的是「同一上传者的同内容记录数」，而磁盘上的物理对象是
+// stored_name；sha256 + kind + owner_id 这个组合想回答的其实是
+// 「还有没有记录引用这个 stored_name」，多绕了一层反而可能漏判。
+// 保留它是为了兼容去重查询的语义对照与既有测试。
 func (s *Store) CountFilesBySHA256(sha string, kind FileKind, ownerID int64) (int, error) {
 	var n int
 	err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM files WHERE sha256 = ? AND kind = ? AND owner_id = ?`,
 		sha, string(kind), ownerID,
+	).Scan(&n)
+	return n, err
+}
+
+// CountFilesByStoredName 统计还有多少条记录引用磁盘上的这个物理文件。
+//
+// 这是删除时唯一正确的引用计数口径：磁盘上被 unlink 的对象是 stored_name，
+// 所以该问的问题就是「还有没有数据库记录指向它」。
+//
+// 不限定 kind / owner：即便某天出现跨类型共享存储名（当前设计上不会，
+// 但历史数据或未来改动可能），只要还有一条记录指向它，就不能删。
+// 宁可留下一个无人引用的孤儿文件（可由维护任务清理），
+// 也不能删掉别人还在用的数据。
+func (s *Store) CountFilesByStoredName(storedName string) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM files WHERE stored_name = ?`,
+		storedName,
 	).Scan(&n)
 	return n, err
 }
@@ -783,27 +929,38 @@ func (s *Store) DeleteFile(id int64) (*File, error) {
 	return f, nil
 }
 
-// ExpiredFiles 返回已过期的临时文件。
-func (s *Store) ExpiredFiles() ([]*File, error) {
-	rows, err := s.db.Query(
-		`SELECT `+fileCols+` FROM files
-		 WHERE kind = ? AND expires_at IS NOT NULL AND expires_at < ?`,
-		string(KindTemporary), time.Now().Unix(),
-	)
-	if err != nil {
+// RenameFile 修改文件的展示名，返回改后的记录。
+//
+// 只管数据库里的 original_name —— 磁盘上的 stored_name 不动。
+// 两者本来就是解耦的（存储名是随机生成的 <unixms>-<hex>.bin），
+// 改展示名因此是一次纯元数据操作：不搬文件、不重算哈希，
+// 对已经生成过的下载链接也没有任何影响。
+//
+// 还要特别注意「内容去重」：同一份内容可能被多条记录共享同一个 stored_name，
+// 本方法只改 WHERE id = ? 命中的那一条，别人的文件名不受影响 ——
+// 这正是「各人看到自己的文件名」得以成立的前提。
+func (s *Store) RenameFile(id int64, name string) (*File, error) {
+	if _, err := s.db.Exec(
+		`UPDATE files SET original_name = ? WHERE id = ?`, name, id); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	// 回读而不是拼一个：调用方拿到的是数据库里真实生效的样子，
+	// 也顺带把「id 不存在」这件事变成 ErrNotFound 暴露出去。
+	return s.FileByID(id)
+}
 
-	out := make([]*File, 0, 8)
-	for rows.Next() {
-		f, err := scanFile(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, f)
+// SetFilePinned 设置文件的置顶状态，返回改后的记录。
+func (s *Store) SetFilePinned(id int64, pinned bool) (*File, error) {
+	// SQLite 没有布尔字面量，存 0/1。
+	v := 0
+	if pinned {
+		v = 1
 	}
-	return out, rows.Err()
+	if _, err := s.db.Exec(
+		`UPDATE files SET pinned = ? WHERE id = ?`, v, id); err != nil {
+		return nil, err
+	}
+	return s.FileByID(id)
 }
 
 // DeleteFileRecord 只删记录，不碰磁盘（清理时磁盘由调用方删）。

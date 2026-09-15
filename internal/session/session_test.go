@@ -11,7 +11,7 @@ import (
 // 因为 reapLoop 的 ticker 是一分钟，直接等太慢；
 // 这里把房间的 expiresAt 手动拨到过去，然后调用与 reapLoop 相同的删除判定。
 func TestReapDeletesExpiredRoom(t *testing.T) {
-	m := &Manager{rooms: map[string]*Room{}}
+	m := newManagerBare()
 
 	r, err := m.CreateWithCode("EXPIRE", 60)
 	if err != nil {
@@ -73,7 +73,7 @@ func TestZeroTTLRejectedByWhitelist(t *testing.T) {
 // 「没有到期时间」，回收逻辑就必须对它明确处理 —— 否则一旦哪天有代码路径
 // 漏设 expiresAt，房间和它名下的聊天文件就会永远留在磁盘上。
 func TestZeroExpiryRoomReapedWhenIdle(t *testing.T) {
-	m := &Manager{rooms: map[string]*Room{}}
+	m := newManagerBare()
 
 	// 直接构造一个 expiresAt 为零值的房间，绕过 API 的白名单校验。
 	r := &Room{
@@ -151,7 +151,7 @@ func TestValidTTL(t *testing.T) {
 // 这条是「房间没了 → 聊天文件一起删」的关键接线：
 // 只要回调漏触发，磁盘上的聊天文件就永远留着。
 func TestRoomGoneHandlerFires(t *testing.T) {
-	m := &Manager{rooms: map[string]*Room{}}
+	m := newManagerBare()
 
 	var got []string
 	m.SetRoomGoneHandler(func(code string) { got = append(got, code) })
@@ -188,7 +188,7 @@ func TestRoomGoneHandlerFires(t *testing.T) {
 // TestNotifyGoneNilSafe 验证没有注册回调时回收不会 panic。
 // 单元测试和不需要该能力的场景都会走这条路。
 func TestNotifyGoneNilSafe(t *testing.T) {
-	m := &Manager{rooms: map[string]*Room{}}
+	m := newManagerBare()
 	r, err := m.CreateWithCode("NOCB", 10)
 	if err != nil {
 		t.Fatalf("创建房间失败: %v", err)
@@ -205,7 +205,7 @@ func TestNotifyGoneNilSafe(t *testing.T) {
 
 // TestActiveCodes 验证活跃房间号集合 —— 孤儿清理靠它做差集。
 func TestActiveCodes(t *testing.T) {
-	m := &Manager{rooms: map[string]*Room{}}
+	m := newManagerBare()
 
 	if got := m.ActiveCodes(); len(got) != 0 {
 		t.Fatalf("空管理器应返回空集合，得到 %v", got)
@@ -240,5 +240,203 @@ func TestActiveCodes(t *testing.T) {
 	got = m.ActiveCodes()
 	if len(got) != 1 || got[0] != "BBB2" {
 		t.Errorf("回收后应只剩 BBB2，得到 %v", got)
+	}
+}
+
+// ---------------------------------------------------------------- 过期房间号复用
+//
+// 以下几条覆盖本轮修复的 P0 问题：复用已过期的房间号时，
+// 旧房间的资源必须先**完成清理**，新同名房间才能可见。
+//
+// 修复前的写法是 `delete(m.rooms, code)` 之后直接建新房间，
+// 完全没调 notifyGone。后果是旧房间的聊天文件既没被删、房号又已经
+// 被新房间占用，于是那些旧文件会「复活」——新房间的成员能下载到
+// 上一代房间的遗留文件。
+
+// expireRoom 把某个房间的到期时间拨到过去，模拟它已经过期。
+func expireRoom(t *testing.T, m *Manager, code string) *Room {
+	t.Helper()
+	r := m.Get(code)
+	if r == nil {
+		t.Fatalf("房间 %s 不存在", code)
+	}
+	r.mu.Lock()
+	r.expiresAt = time.Now().Add(-time.Minute)
+	r.mu.Unlock()
+	if !r.Expired() {
+		t.Fatalf("房间 %s 应当已过期", code)
+	}
+	return r
+}
+
+// TestExpiredRoomReplacementNotifiesGone 是本轮修复的核心断言：
+// 复用过期房间号**必须**触发旧房间的销毁回调。
+func TestExpiredRoomReplacementNotifiesGone(t *testing.T) {
+	m := newManagerBare()
+
+	var gone []string
+	m.SetRoomGoneHandler(func(code string) { gone = append(gone, code) })
+
+	old, err := m.CreateWithCode("ABCD", 10)
+	if err != nil {
+		t.Fatalf("创建房间失败: %v", err)
+	}
+	expireRoom(t, m, "ABCD")
+
+	// 复用同一个房间号。
+	neu, err := m.CreateWithCode("ABCD", 60)
+	if err != nil {
+		t.Fatalf("复用过期房间号应当成功，却失败: %v", err)
+	}
+	if neu == old {
+		t.Fatal("应当是一个全新的 Room，而不是复用旧对象")
+	}
+
+	// 关键断言：旧的房间号必须恰好触发一次 Gone 回调。
+	// 漏掉这一步，旧房间名下的聊天文件就永远不会被清理。
+	if len(gone) != 1 || gone[0] != "ABCD" {
+		t.Fatalf("复用过期房间号必须触发一次 ABCD 的 Gone 回调，得到 %v", gone)
+	}
+
+	// 回调必须已经完成 —— 返回新房间时不能还有清理在后台跑。
+	if m.isRetiring("ABCD") {
+		t.Fatal("CreateWithCode 返回时旧房间不应仍处于回收中")
+	}
+	if m.Get("ABCD") == nil {
+		t.Fatal("新房间应当已经可见")
+	}
+}
+
+// TestGoneFiredBeforeNewRoomVisible 验证「旧清理先于新房间可见」这个顺序保证。
+//
+// 用回调里的探针来观察时序：回调执行时，rooms 里必须还没有这个房间号；
+// 回调结束后才允许出现。若顺序反了，新房间可能在清理过程中被误伤
+// （清理按 room_code 删文件，会把新房间刚上传的文件一起删掉）。
+func TestGoneFiredBeforeNewRoomVisible(t *testing.T) {
+	m := newManagerBare()
+
+	var visibleDuringCleanup *Room
+	var stillRetiringDuringCleanup bool
+
+	m.SetRoomGoneHandler(func(code string) {
+		// 回调里刻意不做任何阻塞，只观察状态：
+		// 此时这个房间号既不该在 rooms 里可见，也必须仍在 retiring 中被钉住，
+		// 否则并发到来的同名创建会绕过清理窗口。
+		visibleDuringCleanup = m.Get(code)
+		stillRetiringDuringCleanup = m.isRetiring(code)
+	})
+
+	if _, err := m.CreateWithCode("WXYZ", 10); err != nil {
+		t.Fatalf("创建房间失败: %v", err)
+	}
+	expireRoom(t, m, "WXYZ")
+
+	if _, err := m.CreateWithCode("WXYZ", 10); err != nil {
+		t.Fatalf("复用失败: %v", err)
+	}
+
+	if visibleDuringCleanup != nil {
+		t.Error("清理期间旧房间不应可见")
+	}
+	if !stillRetiringDuringCleanup {
+		t.Error("清理期间该房间号必须被 retiring 钉住，否则并发创建会插入")
+	}
+}
+
+// TestRetiringBlocksConcurrentCreate 验证回收窗口内不会被抢建同名房间。
+//
+// 场景：清理是慢 I/O，若不加 retiring 屏障，另一个请求可以在这段时间里
+// 把同名房间建出来；随后清理按 room_code 删文件就会误删新房间的数据。
+func TestRetiringBlocksConcurrentCreate(t *testing.T) {
+	m := newManagerBare()
+
+	if _, err := m.CreateWithCode("RACE", 10); err != nil {
+		t.Fatalf("创建房间失败: %v", err)
+	}
+	expireRoom(t, m, "RACE")
+
+	// 在回调里（也就是清理窗口内）尝试创建同名房间，必须被拒绝。
+	var innerErr error
+	m.SetRoomGoneHandler(func(code string) {
+		_, innerErr = m.CreateWithCode(code, 10)
+	})
+
+	if _, err := m.CreateWithCode("RACE", 10); err != nil {
+		t.Fatalf("首次复用应当成功: %v", err)
+	}
+	if innerErr != ErrCodeTaken {
+		t.Fatalf("回收窗口内创建同名房间应返回 ErrCodeTaken，得到 %v", innerErr)
+	}
+}
+
+// TestGenerateCodeAvoidsRetiring 验证自动生成的房间号不会落在正在回收的号上。
+func TestGenerateCodeAvoidsRetiring(t *testing.T) {
+	m := newManagerBare()
+
+	// 人为把一个房间号钉在 retiring 里。
+	m.mu.Lock()
+	m.retiring["FIXD"] = struct{}{}
+	m.mu.Unlock()
+
+	// GenerateCode 是随机的，单独跑一次可能撞不上；这里跑足够多次，
+	// 只要实现里读了 retiring，就绝不该生成 FIXD。
+	for i := 0; i < 2000; i++ {
+		if code := m.GenerateCode(); code == "FIXD" {
+			t.Fatal("GenerateCode 生成了正在回收中的房间号")
+		}
+	}
+}
+
+// TestReapOnceSkipsRetiring 验证回收协程不会重复处理正在回收的房间号。
+//
+// 这保证「后台回收」与「复用同名房间号」两条路径不会同时清理同一个
+// room_code —— 否则回调会触发两次，第二次删的可能是新房间的文件。
+func TestReapOnceSkipsRetiring(t *testing.T) {
+	m := newManagerBare()
+
+	var gone int
+	m.SetRoomGoneHandler(func(string) { gone++ })
+
+	if _, err := m.CreateWithCode("SKIP", 10); err != nil {
+		t.Fatalf("创建房间失败: %v", err)
+	}
+
+	// 把它摘出 rooms 并标记 retiring，模拟「复用流程正卡在清理中」。
+	m.mu.Lock()
+	delete(m.rooms, "SKIP")
+	m.retiring["SKIP"] = struct{}{}
+	m.mu.Unlock()
+
+	m.reapOnce(time.Now())
+
+	if gone != 0 {
+		t.Fatalf("正在回收的房间不该被 reapOnce 再次处理，回调触发 %d 次", gone)
+	}
+	if !m.isRetiring("SKIP") {
+		t.Fatal("retiring 标记不该被 reapOnce 清掉")
+	}
+}
+
+// TestReapOnceMarksRetiringThenClears 验证后台回收走完之后 retiring 会被清空，
+// 否则这个房间号会被永久占用，永远无法再被创建。
+func TestReapOnceMarksRetiringThenClears(t *testing.T) {
+	m := newManagerBare()
+
+	r, err := m.CreateWithCode("FREEME", 10)
+	if err != nil {
+		t.Fatalf("创建房间失败: %v", err)
+	}
+	r.mu.Lock()
+	r.expiresAt = time.Now().Add(-time.Minute)
+	r.mu.Unlock()
+
+	m.reapOnce(time.Now())
+
+	if m.isRetiring("FREEME") {
+		t.Fatal("回收完成后 retiring 应当已清空")
+	}
+	// 回收后房间号应当可以再次占用。
+	if _, err := m.CreateWithCode("FREEME", 10); err != nil {
+		t.Fatalf("回收后房间号应当可复用，却失败: %v", err)
 	}
 }

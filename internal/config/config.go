@@ -26,7 +26,7 @@ type Config struct {
 	// DatabasePath 是 SQLite 数据库文件路径。
 	DatabasePath string
 
-	// FilesRoot 是文件仓库根目录，其下分 permanent/ 与 temporary/。
+	// FilesRoot 是文件仓库根目录，其下分 permanent/ 与 chat/。
 	FilesRoot string
 
 	// LogPath 是日志文件路径，会做大小限制防止无限增长。
@@ -46,9 +46,6 @@ type Config struct {
 
 	// MaxUploadBytes 是单次上传的大小上限，0 表示不限制。
 	MaxUploadBytes int64
-
-	// TempFileDefaultTTL 是临时文件的默认存活时间（秒）。
-	TempFileDefaultTTL int
 
 	// ChatMaxUploadBytes 是聊天室单文件上限，0 表示不限制。
 	//
@@ -100,8 +97,15 @@ const (
 //	LANSHARE_DB             SQLite 路径
 //	LANSHARE_FILES          文件仓库根目录
 //	LANSHARE_LOG            日志文件路径
-//	LANSHARE_MAX_UPLOAD_MB  文件仓库单次上传上限（MB），0 表示不限制
-//	LANSHARE_CHAT_UPLOAD_MB 聊天室单文件上限（MB），留空用 DefaultChatMaxUpload
+//	LANSHARE_MAX_UPLOAD_MB  文件仓库单次上传上限（MB），0 或留空表示不限制
+//	LANSHARE_CHAT_UPLOAD_MB 聊天室单文件上限（MB），0 表示聊天室不限制，
+//	                        留空用 DefaultChatMaxUpload（100 MB）
+//
+// 两个上传上限**完全独立**：各自解析、各自生效，互不回落、互不覆盖。
+// 早先的实现会把「未配置」当成「用另一个变量的值」，于是
+// 「仓库不限 + 聊天室 100MB」这个最常见的组合根本表达不出来 ——
+// 现在 LANSHARE_CHAT_UPLOAD_MB=0 就是聊天室不限，不会再被仓库的值顶掉。
+//
 //	LANSHARE_UPLOAD_CONCURRENCY 服务端同时处理的上传数，0 表示不限，默认 2
 func Load() (*Config, error) {
 	root := env("LANSHARE_ROOT", DefaultRoot)
@@ -114,7 +118,6 @@ func Load() (*Config, error) {
 		LogPath:            env("LANSHARE_LOG", filepath.Join(root, "logs", "lan-share.log")),
 		TmpDir:             env("TMPDIR", filepath.Join(root, "tmp")),
 		SessionTTL:         30 * 24 * 3600,       // 30 天
-		TempFileDefaultTTL: 6 * 3600,             // 6 小时
 		ChatMaxUploadBytes: DefaultChatMaxUpload, // 100 MB
 		UploadConcurrency:  DefaultUploadConcurrency,
 	}
@@ -160,7 +163,6 @@ func (c *Config) EnsureDirs() error {
 	dirs := []string{
 		filepath.Dir(c.DatabasePath),
 		filepath.Join(c.FilesRoot, "permanent"),
-		filepath.Join(c.FilesRoot, "temporary"),
 		filepath.Join(c.FilesRoot, "chat"),
 		filepath.Dir(c.LogPath),
 		c.TmpDir,
