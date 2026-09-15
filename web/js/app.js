@@ -1259,6 +1259,10 @@ function isImageMsg(m) {
  *
  * 尺寸交给 CSS 约束（max-width / max-height），这样不同分辨率的截图
  * 进到消息流里宽度一致，不会一条撑满、一条只有指甲盖大。
+ *
+ * 卡片自带一枚「下载」按钮（右下角，悬停浮现）。
+ * 图片消息的内容就是那张图，没有可复制的文字 —— 通用复制按钮对它没意义，
+ * 内容区右上角只留一个真正能用的动作。
  */
 function buildImageCard(m) {
   const wrap = document.createElement('div');
@@ -1283,6 +1287,29 @@ function buildImageCard(m) {
   });
 
   wrap.appendChild(img);
+
+  // 下载按钮：右下角，悬停时浮现（和 .msg-tools 同一套显隐节奏）。
+  // 链接指向**不带** inline 的地址，与灯箱里的「下载原图」同源 ——
+  // inline 那个是给 <img> 内联显示用的，拿它做下载语义上不干净。
+  const dl = document.createElement('a');
+  dl.className = 'btn btn-icon msg-image-dl';
+  dl.href = url;
+  dl.setAttribute('download', m.fileName || '');
+  dl.title = '下载' + (m.fileName ? ' ' + m.fileName : '');
+  dl.setAttribute('aria-label', '下载' + (m.fileName || '图片'));
+  dl.innerHTML = '<svg viewBox="0 0 20 20" width="15" height="15">'
+    + '<path d="M10 3v8.5m0 0L6.8 8.3M10 11.5l3.2-3.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+    + '<path d="M4 14.5V15a2 2 0 002 2h8a2 2 0 002-2v-.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+  // 卡片整体是「点击看大图」，按钮上要掐掉冒泡，否则点下载会顺带弹灯箱。
+  // 无 href 时（极端兜底）降级成复制地址，别给一个点了没反应的按钮。
+  dl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (!dl.getAttribute('href')) {
+      e.preventDefault();
+      copyText(url).then((ok) => toast(ok ? '地址已复制' : '复制失败', ok ? 'ok' : 'err'));
+    }
+  });
+  wrap.appendChild(dl);
 
   // 点图看大图。用 button 语义包一层会破坏 .msg-image 的圆角裁切，
   // 所以直接给 img 挂 click + 键盘可达性。
@@ -1411,21 +1438,25 @@ function appendMessage(m, animate, optimistic, mineHint) {
   }
 
   // 工具栏（复制 / 打开）
+  // 图片消息没有可复制的文本（m.content 是空的），复制按钮放这儿只会点了没反应 ——
+  // 它的下载按钮已经贴在图片右下角了，这里整体让位。
   const tools = document.createElement('div');
   tools.className = 'msg-tools';
 
-  const copyBtn = document.createElement('button');
-  copyBtn.className = 'btn btn-icon';
-  copyBtn.title = '复制内容';
-  copyBtn.setAttribute('aria-label', '复制内容');
-  copyBtn.innerHTML = '<svg viewBox="0 0 20 20" width="15" height="15">'
-    + '<rect x="7" y="7" width="9" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>'
-    + '<path d="M13 5.5V5a2 2 0 00-2-2H6a2 2 0 00-2 2v7a2 2 0 002 2h.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
-  copyBtn.addEventListener('click', async () => {
-    const ok = await copyText(m.content);
-    toast(ok ? '已复制' : '复制失败，请手动选择', ok ? 'ok' : 'err');
-  });
-  tools.appendChild(copyBtn);
+  if (!(m.type === 'file' && isImageMsg(m))) {
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'btn btn-icon';
+    copyBtn.title = '复制内容';
+    copyBtn.setAttribute('aria-label', '复制内容');
+    copyBtn.innerHTML = '<svg viewBox="0 0 20 20" width="15" height="15">'
+      + '<rect x="7" y="7" width="9" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>'
+      + '<path d="M13 5.5V5a2 2 0 00-2-2H6a2 2 0 00-2 2v7a2 2 0 002 2h.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+    copyBtn.addEventListener('click', async () => {
+      const ok = await copyText(m.content);
+      toast(ok ? '已复制' : '复制失败，请手动选择', ok ? 'ok' : 'err');
+    });
+    tools.appendChild(copyBtn);
+  }
 
   if (m.type === 'link') {
     const openBtn = document.createElement('button');

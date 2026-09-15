@@ -687,6 +687,7 @@ button, input, textarea { font: inherit; color: inherit; }
 }
 .msg-image {
   display: block;
+  position: relative;      /* 下载按钮的定位基准 */
   line-height: 0;           /* 去掉 img 作为 inline 元素时的基线留白 */
   border-radius: var(--radius-sm);
   overflow: hidden;
@@ -712,6 +713,34 @@ button, input, textarea { font: inherit; color: inherit; }
 }
 /* 加载失败降级成文件卡片时，别继承 .msg-image 的圆角边框。 */
 .msg-file.is-fallback { border-radius: 0; }
+
+/* 图片右下角的下载按钮。
+ *
+ * 压在图上而不是摆在图外面：图片消息的宽度由内容决定（见 .msg.is-image），
+ * 放外面会让工具条在窄图下方左右晃，压在角上位置才稳定。
+ *
+ * 因为是浮在图片上，深色图浅色图都会遇到，所以不跟随主题取色 ——
+ * 固定用半透明黑底 + 白图标，在任何底图上都读得出来。 */
+.msg-image-dl {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 26px;
+  height: 26px;
+  color: #fff;
+  background: rgba(16, 18, 24, .58);
+  border-color: rgba(255, 255, 255, .18);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  opacity: 0;
+  transition: opacity .14s;
+}
+.msg-image:hover .msg-image-dl,
+.msg-image:focus-within .msg-image-dl { opacity: 1; }
+.msg-image-dl:hover { background: rgba(16, 18, 24, .82); border-color: rgba(255, 255, 255, .35); color: #fff; }
+@media (hover: none) {
+  .msg-image-dl { opacity: 1; }   /* 触屏没有 hover，直接常显 */
+}
 
 /* 图片气泡的宽度交给内容决定（否则 max-width:88% 会把窄图拉成一条空边）。
  * 注意 .msg 自身的 max-width 仍是 88%，这里只是允许它小于那个值。 */
