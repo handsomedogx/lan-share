@@ -52,7 +52,7 @@ if errorlevel 1 (
   echo   [SKIP] python not found, cannot verify. Check dist\lan-share manually:
   echo          it must be an ELF, NOT a PE/MZ file.
 ) else (
-  python "%~dp0verify-arch.py"
+  uv run python "%~dp0verify-arch.py"
   if errorlevel 1 goto :fail
 )
 
