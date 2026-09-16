@@ -273,7 +273,7 @@ async function upload(name, content, cookie) {
     ok(chk.status === 404, '删除后确实取不到了（404）', 'status=' + chk.status);
   }
 
-  // ---- 7. 静态页面：遮罩文案不能再是「需要登录」----
+  // ---- 7. 静态页面：未登录提示的文案与形态 ----
   section('7. 登录页文案与服务端渲染的 HTML');
   {
     const r = await request('GET', '/');
@@ -282,12 +282,40 @@ async function upload(name, content, cookie) {
     ok(!html.includes('文件仓库需要登录'), '页面里已无「文件仓库需要登录」字样');
 
     // 只切片看 #lockOverlay 容器，避开其它位置的合理用词。
+    // 用固定宽度切窗：容器从浮卡换成横幅后内部结构变了，
+    // 以前靠 'lock-card' 定位结尾的写法会算出空切片，断言全部失真。
     const start = html.indexOf('id="lockOverlay"');
     ok(start >= 0, '页面里能找到 #lockOverlay');
     if (start >= 0) {
-      const slice = html.slice(start, html.indexOf('</div>', html.indexOf('lock-card', start) + 400));
-      ok(slice.includes('登录后可上传'), '遮罩标题是「登录后可上传」', slice.slice(0, 120));
-      ok(slice.includes('浏览和下载无需登录'), '遮罩文案说明了下载无需登录');
+      const slice = html.slice(start, start + 700);
+      ok(slice.includes('登录后可上传'), '提示条标题是「登录后可上传」', slice.slice(0, 120));
+      ok(slice.includes('浏览和下载无需登录'), '提示条文案说明了下载无需登录');
+    }
+
+    // CSS 层回归守卫：提示条一旦回到绝对定位，就会重新压住列表最右侧的下载列。
+    const cssRes = await request('GET', '/css/style.css');
+    if (cssRes.status === 200) {
+      const css = cssRes.body.toString('utf8');
+      const i = css.indexOf('.lock-banner');
+      ok(i >= 0, 'CSS 里有 .lock-banner');
+      if (i >= 0) {
+        const rule = css.slice(i, css.indexOf('}', i));
+        ok(!/position:\s*absolute/.test(rule), '提示条在文档流里，不是绝对定位浮层', rule.replace(/\s+/g, ' ').slice(0, 120));
+      }
+
+      // 同一层再守两条今天踩过的布局：
+      //   1) 对方消息气泡要自己收缩（align-self），否则会被 .messages 的
+      //      align-items:stretch 拉满整行；这里顺带排除 short-message 又被名字行撑宽的老毛病。
+      //   2) 窄屏必须是「文档单滚动容器」：html/body 交出固定高度 + .messages 不再自建滚动条。
+      //      一旦回退，手指从聊天区下拉就又被内层吃掉（手机端页面不动）。
+      const bodyRule = css.slice(css.indexOf('.msg-body'), css.indexOf('}', css.indexOf('.msg-body')));
+      ok(/align-self:\s*flex-start/.test(bodyRule), '消息气泡按内容收缩（.msg-body align-self: flex-start）',
+        bodyRule.replace(/\s+/g, ' ').slice(0, 120));
+      const narrow = css.slice(css.indexOf('@media (max-width: 1000px)'));
+      ok(/html,\s*body\s*\{\s*height:\s*auto/.test(narrow), '窄屏让文档自己滚（html/body height: auto）');
+      ok(/\.messages\s*\{[^}]*overflow:\s*visible/.test(narrow), '窄屏消息区不再是内层滚动容器');
+    } else {
+      ok(false, '取到 /css/style.css 以校验提示条定位', 'status=' + cssRes.status);
     }
   }
 

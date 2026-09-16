@@ -1009,47 +1009,38 @@ button, input, textarea { font: inherit; color: inherit; }
 .table-empty p { font-size: 13.5px; color: var(--text-2); }
 .table-empty small { font-size: 11.5px; }
 
-/* 未登录遮罩 */
-/* 未登录时，上传按钮上方的浮层。
+/* 未登录提示条
  *
- * 它**只挂在右上角的上传按钮上**，不覆盖整块面板 ——
- * 因为浏览和下载对所有人开放，未登录用户同样要能看到列表、点下载，
- * 铺一层模糊遮罩会把这两件事一起挡住。
+ * 它只说明「为什么上传按钮是灰的」，而且**必须留在文档流里**。
+ * 上一版是绝对定位的浮卡（top:13px / right:16px / width:246px），
+ * 卡片高约 200px，从面板右上角往下悬垂，正好压住表格最右侧的
+ * 「上传者 / 下载」两列 —— 未登录用户在最需要下载的时候点不到下载按钮。
+ * 换成横向条后布局里多了这一行，任何一行文件都不会被压住。
  *
- * 定位对齐面板头里的按钮：头部 padding 13px 16px，按钮高 30px，
- * 所以按钮占 y ∈ [13, 43]；遮罩从 top: 13px 起，正好压住按钮。
- * z-index 高于面板头，保证点得到。
+ * 文案只说「不能上传」：浏览和下载对所有人开放，
+ * 写成「仓库需要登录」会把只想下载的人劝退。
  */
-.lock-overlay {
-  position: absolute;
-  top: 13px;
-  right: 16px;
-  z-index: 6;
-  display: block;
-}
-.lock-card {
-  position: absolute;
-  top: 0;
-  right: 0;
-  width: 246px;
+.lock-banner {
   display: flex;
-  flex-direction: column;
+  flex: 0 0 auto;   /* 面板是 flex 列：宁可让下面的列表滚动，也不许把这一条压扁 */
   align-items: center;
-  gap: 8px;
-  text-align: center;
-  padding: 16px 16px 14px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-strong);
-  background: var(--surface);
-  box-shadow: var(--sh-2);
+  gap: 12px;
+  padding: 11px 16px;
+  background: var(--accent-weak);
+  border-bottom: 1px solid var(--border);
   color: var(--accent);
 }
-.lock-card h3 { font-size: 13.5px; color: var(--text); }
-.lock-card p { font-size: 12px; color: var(--text-2); line-height: 1.6; }
-.lock-card .btn { margin-top: 2px; height: 30px; padding: 0 14px; font-size: 12.5px; }
-/* 盖住的其实是被禁用的上传按钮，本身不需要被点 —— 但卡片里的按钮要能点。 */
-.lock-overlay { pointer-events: none; }
-.lock-card { pointer-events: auto; }
+.lock-banner svg { flex: 0 0 auto; }
+.lock-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.lock-text strong { font-size: 13px; font-weight: 600; color: var(--text); }
+.lock-text span { font-size: 12px; color: var(--text-2); line-height: 1.5; }
+.lock-banner .btn { flex: 0 0 auto; }
 
 /* 拖拽提示 */
 .drop-veil {

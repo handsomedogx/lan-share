@@ -147,18 +147,23 @@
     <!-- 上传进度 -->
     <div class="upload-list" id="uploadList" hidden></div>
 
-    <!-- 未登录遮罩：只盖住「上传」按钮，下载 / 浏览对所有人开放。
-         所以文案里不提「下载」，也别再说整个仓库需要登录 —— 会把人劝退。 -->
-    <div class="lock-overlay" id="lockOverlay" hidden>
-      <div class="lock-card">
-        <svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true">
-          <path d="M7 10V7a5 5 0 0110 0v3" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>
-          <rect x="4.5" y="10" width="15" height="10.5" rx="3" fill="none" stroke="currentColor" stroke-width="1.9"/>
-        </svg>
-        <h3 id="lockTitle">登录后可上传</h3>
-        <p id="lockText">浏览和下载无需登录。登录后可以上传、管理自己的文件。</p>
-        <button class="btn btn-primary" id="btnLoginFromLock">立即登录</button>
+    <!-- 未登录提示条：说明「为什么上传按钮是灰的」，且**留在文档流里**，不覆盖列表。
+         踩过的坑：早先它是绝对定位的浮卡（top:13px / right:16px / width:246px），
+         卡片高约 200px，从面板右上角往下悬垂，正好压住表格最右侧的
+         「上传者 / 下载」两列 —— 未登录用户在最需要下载时点不到下载按钮。
+         换成横向条后，列表整体下移，没有任何一行会被挡住。
+         文案只说「不能上传」：浏览和下载对所有人开放，
+         写成「仓库需要登录」会把只想下载的人劝退。 -->
+    <div class="lock-banner" id="lockOverlay" hidden>
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+        <path d="M7 10V7a5 5 0 0110 0v3" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>
+        <rect x="4.5" y="10" width="15" height="10.5" rx="3" fill="none" stroke="currentColor" stroke-width="1.9"/>
+      </svg>
+      <div class="lock-text">
+        <strong id="lockTitle">登录后可上传</strong>
+        <span id="lockText">浏览和下载无需登录。登录后可以上传、管理自己的文件。</span>
       </div>
+      <button class="btn btn-primary btn-sm" id="btnLoginFromLock">立即登录</button>
     </div>
 
   <!-- 文件表格：表头与表体各是一个 table，靠固定列宽 + table-layout 对齐。

@@ -37,7 +37,7 @@ out = out.replace(/<script[\s\S]*?<\/script>/gi, '');
 out = out.replace(/<link[^>]*rel=["']preconnect["'][^>]*>/gi, '');
 
 // 4) 首屏：模拟「未登录 + 仓库里已有 3 个文件」
-//    把遮罩的 hidden 去掉，把表格内容写死，并让左侧实时区显示一个空态。
+//    把未登录提示条的 hidden 去掉，把表格内容写死，并让左侧实时区显示一个空态。
 const demoRows = `
           <tr>
             <td><div class="cell-name"><span class="ftype" data-t="PDF">PDF</span><div style="min-width:0"><div class="fname" title="路由器固件说明.pdf">路由器固件说明.pdf</div></div></div></td>
@@ -73,11 +73,10 @@ const demoRows = `
             </td>
           </tr>`;
 
-// 去掉锁遮罩的 hidden（让它显示出来）
-out = out.replace(
-  /(<div class="lock-overlay" id="lockOverlay") hidden/,
-  '$1'
-);
+// 去掉未登录提示条的 hidden（让它显示出来）。
+// 只认 id，不认类名 —— 这个容器从浮卡改成横幅时类名换过，
+// 按类名匹配的旧写法会静默失配，预览里就看不到提示条。
+out = out.replace(/(id="lockOverlay")\s+hidden/, '$1');
 
 // 写死表格行：替换空的 tbody 内容
 out = out.replace(
@@ -108,7 +107,7 @@ out = out.replace(
   <div style="position:fixed;left:0;right:0;bottom:0;z-index:9999;padding:7px 14px;
               font:12px/1.5 -apple-system,'Segoe UI',sans-serif;color:#fff;
               background:#3b4252;text-align:center;">
-    静态预览（未登录状态）· 只看文件仓库右上角：遮罩只盖住「上传」按钮，下载按钮仍然可见可点
+    静态预览（未登录状态）· 看文件仓库：提示条在列表上方成一行，不覆盖任何文件的下载按钮
   </div>`
 );
 

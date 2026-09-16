@@ -437,21 +437,24 @@ function renderSetup() {
   const tabs = $('#authTabs');
   if (tabs) tabs.hidden = !(needSetup || s.registrationOpen);
 
-  // 锁屏卡片的文案也随状态变化。
-  // 注意用词：遮罩只挡上传，浏览和下载对所有人开放 —— 文案不能说成「仓库需要登录」。
-  if (needSetup) {
-    setText($('#lockTitle'), '先创建一个账号');
-    setText($('#lockText'), '这是第一次部署，第一个注册的人将成为管理员。浏览和下载无需登录。');
-    setText($('#btnLoginFromLock'), '创建管理员账号');
-  } else if (!s.registrationOpen) {
-    setText($('#lockTitle'), '登录后可上传');
-    setText($('#lockText'), '浏览和下载无需登录。登录后可以上传、管理自己的文件。注册已关闭，请联系管理员开通。');
-    setText($('#btnLoginFromLock'), '立即登录');
-  } else {
-    setText($('#lockTitle'), '登录后可上传');
-    setText($('#lockText'), '浏览和下载无需登录。登录或注册后即可上传、管理自己的文件。');
+  // 提示条的文案随注册开关变化。
+  // 注意用词：提示条只说明「不能上传」，浏览和下载对所有人开放 ——
+  // 文案不能说成「仓库需要登录」。
+  // needSetup 时不需要写文案：那种情况下提示条本身是隐藏的，
+  // 引导由上面的 setup-banner 承担（同一个入口不重复给两次）。
+  if (!needSetup) {
+    if (!s.registrationOpen) {
+      setText($('#lockTitle'), '登录后可上传');
+      setText($('#lockText'), '浏览和下载无需登录。登录后可以上传、管理自己的文件。注册已关闭，请联系管理员开通。');
+    } else {
+      setText($('#lockTitle'), '登录后可上传');
+      setText($('#lockText'), '浏览和下载无需登录。登录或注册后即可上传、管理自己的文件。');
+    }
     setText($('#btnLoginFromLock'), '立即登录');
   }
+
+  // needSetup 会决定提示条显不显示，所以状态刷新后要重算一次。
+  renderLock();
 }
 
 /** 刷新运行状态（版本、用量、注册开关）。 */
@@ -1561,18 +1564,22 @@ function autoGrow(el) {
 
 /* ------------------------------------------------------------------ 7. 文件仓库 */
 
-/** 渲染未登录遮罩。
+/** 渲染未登录提示条。
  *
- * 遮罩**只盖住上传按钮**（`inset: 44px -8px -8px auto`，靠 CSS 定位）。
- * 列表、下载、删除按钮都在遮罩之外 ——
- * 未登录时能看能下，只是不能传，所以不该把整块区域糊住。
+ * 提示条只解释「上传按钮为什么是灰的」，**不覆盖列表**：
+ * 它是面板里的一行文档流（`.lock-banner`），列表整体下移，
+ * 每一行的下载按钮都照常可见可点。
+ * （曾经是右上角往下悬垂的绝对定位浮卡，把「上传者 / 下载」两列压住了。）
+ *
+ * 首次部署（needSetup）时不显示：那时 setup-banner 已经给了同一个入口，
+ * 两条提示并排只会重复。
  */
 function renderLock() {
-  const need = !state.user;
+  const need = !state.user && !(state.status && state.status.needSetup);
   const overlay = $('#lockOverlay');
   if (overlay) overlay.hidden = !need;
   const btn = $('#btnUpload');
-  if (btn) btn.disabled = need;
+  if (btn) btn.disabled = !state.user;
 }
 
 /** 拉取文件列表。 */
