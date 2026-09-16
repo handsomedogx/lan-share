@@ -123,6 +123,22 @@
     <div class="pane-head">
       <h2>文件仓库</h2>
       <div class="pane-head-actions">
+        <!-- 搜索只在前端过滤：列表本来就已全量拉到本地，再跑一趟服务端
+             换不来任何东西，还要多一次往返。放在这一行里（而不是另起一行），
+             是为了让「上传」始终停在同一个视线高度上。 -->
+        <div class="search-box">
+          <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+            <circle cx="8.8" cy="8.8" r="5.3" fill="none" stroke="currentColor" stroke-width="1.7"/>
+            <path d="M12.8 12.8L17 17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+          <!-- 刻意用 type="text" 而不是 search：WebKit 会给 search 塞一个
+               自带样式的清除按钮，和右边的 × 重复，且无法去掉。 -->
+          <input id="fileSearch" class="search-input" type="text" inputmode="search"
+                 autocomplete="off" spellcheck="false" placeholder="搜索文件名"
+                 aria-label="按文件名搜索">
+          <button type="button" class="search-clear" id="btnClearSearch" hidden
+                  aria-label="清除搜索" title="清除搜索">×</button>
+        </div>
         <button class="btn btn-primary btn-sm" id="btnUpload">上传文件</button>
         <input type="file" id="fileInput" hidden multiple>
       </div>
@@ -191,8 +207,8 @@
         <tbody id="fileBody"></tbody>
       </table>
       <div class="table-empty" id="fileEmpty">
-        <p>文件仓库还是空的</p>
-        <small>上传过的文件会长期保存在路由器数据分区</small>
+        <p id="fileEmptyTitle">文件仓库还是空的</p>
+        <small id="fileEmptyHint">上传过的文件会长期保存在路由器数据分区</small>
       </div>
     </div>
   </div>

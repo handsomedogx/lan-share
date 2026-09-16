@@ -286,6 +286,66 @@ button, input, textarea { font: inherit; color: inherit; }
 .pane-head h2 { font-size: 14.5px; }
 .pane-head-actions { display: flex; align-items: center; gap: 8px; }
 
+/* 文件搜索框
+ *
+ * 宽度给死 200px 而不是让它自由伸缩：面板宽度会随窗口变化，
+ * 放任 flex 撑开的话，搜索框会随窗口一起变宽变窄，输入时视觉焦点跟着飘。
+ * 窄屏（≤620px）再放开成弹性 —— 那时它独占一整行，见文件末尾的媒体查询。
+ */
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  width: 200px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--surface);
+  color: var(--text-3);
+  transition: border-color .14s, box-shadow .14s;
+}
+/* 焦点态画在容器上（focus-within）而不是 input 上：
+ * input 自己无边框，只有容器加亮才是一个完整的输入框。 */
+.search-box:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+.search-box svg { flex: 0 0 auto; }
+
+.search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 13px;
+  color: var(--text);
+}
+.search-input::placeholder { color: var(--text-3); }
+
+/* 清除按钮常驻占位（见 HTML 里的 hidden 切换），不隐藏时也不参与收缩，
+ * 否则输入长词时 × 会被挤出去 —— 那正好是最需要它的时候。 */
+.search-clear {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 99px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.search-clear:hover { background: var(--surface-2); color: var(--text); }
+
 /* ---------------------------------------------------------------- 实时区 */
 .session-bar {
   flex: 0 0 auto;
@@ -964,6 +1024,17 @@ button, input, textarea { font: inherit; color: inherit; }
 }
 .fmeta { font-size: 11px; color: var(--text-3); margin-top: 1px; }
 
+/* 搜索命中的片段。
+ * 不用 <mark> 的默认亮黄：那颜色在深色主题下刺眼，压在置顶行的蓝色底上
+ * 也脏。改用强调色的浅底，深浅两套主题下都成立。
+ * 不加 padding —— 加了会让省略号位置随命中位置来回跳。 */
+.fname mark {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  color: inherit;
+  border-radius: 2px;
+  font-weight: 600;
+}
+
 /* 可改名的文件名：悬停时加一条虚线下划线当作提示。
    没有这条线，双击改名这个能力就没有任何可见入口 —— 用户不会去双击试试。 */
 .fname.is-renamable { cursor: text; }
@@ -1426,6 +1497,10 @@ button, input, textarea { font: inherit; color: inherit; }
   .join-row { flex-direction: column; }
   .join-row .btn { width: 100%; }
   .pane-head { flex-wrap: wrap; }
+  /* 头部换行后，操作区独占一行：搜索框吃掉剩余宽度，
+     上传按钮留在右端 —— 两者都别缩成看不清的样子。 */
+  #filesPane .pane-head-actions { flex: 1 1 100%; }
+  #filesPane .search-box { flex: 1 1 auto; width: auto; min-width: 0; }
 }
 
 /* 尊重系统的「减少动效」偏好 */

@@ -183,6 +183,8 @@ function extOf(name) {
 const state = {
   user: null,            // 当前登录用户，null 表示未登录
   files: [],             // 文件列表缓存（仓库只有永久文件，没有分类）
+  filesTotalText: '',    // 服务端给的总体积文案，未搜索时直接用它
+  fileQuery: '',         // 文件仓库的搜索词（纯前端过滤，见 visibleFiles）
 
   authMode: 'login',     // login | register
   status: null,          // /api/status 最近一次结果
@@ -1593,27 +1595,154 @@ async function loadFiles() {
       // 列表已对所有人开放，401 理论上不会出现；真出现了就当空列表处理，
       // 别把「未登录」渲染成错误提示。
       state.files = [];
+      state.filesTotalText = '';
       renderFiles();
       toast(data.error || '读取文件列表失败', 'err');
       return;
     }
     state.files = data.files || [];
+    state.filesTotalText = data.totalText || '';
+    // 搜索词不清：刷新、上传完成、置顶后都会走到这里，
+    // 每次都把用户刚敲的词抹掉会很难用。过滤在 renderFiles 里重新应用。
     renderFiles();
-    setText($('#usageText'), state.files.length + ' 个文件 · 共 ' + (data.totalText || '0 B'));
-    setText($('#usageHint'), state.user ? '长期保存在路由器数据分区' : '浏览与下载无需登录');
   } catch (_) {
     setStatus('文件列表读取失败', '');
   }
 }
 
+/* ------------------------------------------------- 文件搜索（纯前端过滤） */
+
+/**
+ * 把搜索词拆成小写关键词。
+ *
+ * 按空白切分后**要求全部命中**，而不是拿整串做子串匹配：
+ * 「截图 2024」这种写法在文件名搜索里很自然，整串匹配会一个都搜不到
+ * （真实文件名里「截图」和「2024」之间一定隔着别的东西）。
+ */
+function searchTokens() {
+  const q = trim(state.fileQuery).toLowerCase();
+  return q ? q.split(/\s+/) : [];
+}
+
+/** 文件名是否命中全部关键词（大小写不敏感）。 */
+function nameMatches(name, tokens) {
+  const n = String(name || '').toLowerCase();
+  return tokens.every((t) => n.indexOf(t) >= 0);
+}
+
+/**
+ * 构造带高亮片段的名字节点；没命中任何关键词时返回 null，调用方退回纯文本。
+ *
+ * 用 DocumentFragment 而不是拼 innerHTML：文件名是用户内容，
+ * 拼字符串就得自己保证转义不出错，交给 createTextNode 就没有这个面。
+ */
+function highlightedName(name, tokens) {
+  const src = String(name || '');
+  if (!tokens.length) return null;
+  const lower = src.toLowerCase();
+
+  // 先把每个关键词的全部出现位置收集成区间，再合并重叠部分 ——
+  // 「aab」搜「aa ab」会得到两段重叠区间，不合并就会切出嵌套的节点。
+  const ranges = [];
+  tokens.forEach((t) => {
+    let from = 0;
+    for (;;) {
+      const i = lower.indexOf(t, from);
+      if (i < 0) break;
+      ranges.push([i, i + t.length]);
+      from = i + t.length;   // 关键词非空，这样必然前进，不会死循环
+    }
+  });
+  if (!ranges.length) return null;
+
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  ranges.forEach((r) => {
+    const last = merged[merged.length - 1];
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+    else merged.push([r[0], r[1]]);
+  });
+
+  const frag = document.createDocumentFragment();
+  let pos = 0;
+  merged.forEach(([s, e]) => {
+    if (s > pos) frag.appendChild(document.createTextNode(src.slice(pos, s)));
+    const mark = document.createElement('mark');
+    mark.textContent = src.slice(s, e);
+    frag.appendChild(mark);
+    pos = e;
+  });
+  if (pos < src.length) frag.appendChild(document.createTextNode(src.slice(pos)));
+  return frag;
+}
+
+/** 读取搜索框内容并重绘列表。 */
+function applySearch() {
+  const input = $('#fileSearch');
+  state.fileQuery = input ? input.value : '';
+  const clear = $('#btnClearSearch');
+  if (clear) clear.hidden = trim(state.fileQuery) === '';
+  renderFiles();
+}
+
+/** 清空搜索（× 按钮与 Esc 共用）。 */
+function clearSearch() {
+  const input = $('#fileSearch');
+  if (input) {
+    input.value = '';
+    // 清空后把光标留在框里，方便直接敲下一个词；
+    // 点 × 时焦点本来在按钮上，不抢回来就得再点一次输入框。
+    input.focus();
+  }
+  applySearch();
+}
+
+/**
+ * 空态文案。
+ *
+ * 「仓库是空的」和「搜索没命中」是两件事：后者必须给出出口，
+ * 否则用户会以为文件没了 —— 尤其在他刚上传完、只是词打错了的时候。
+ */
+function renderFilesEmpty(total, shown, searching) {
+  const box = $('#fileEmpty');
+  if (!box) return;
+  box.hidden = shown > 0;
+  if (shown > 0) return;
+
+  if (searching && total > 0) {
+    setText($('#fileEmptyTitle'), '没有匹配的文件');
+    setText($('#fileEmptyHint'),
+      total + ' 个文件里没有名字含「' + trim(state.fileQuery) + '」的，换个关键词或清空搜索');
+  } else {
+    // total 为 0 时即使正在搜索也说「仓库是空的」—— 那时「换个关键词」
+    // 是个假建议，仓库里本来就没有任何东西可搜。
+    setText($('#fileEmptyTitle'), '文件仓库还是空的');
+    setText($('#fileEmptyHint'), '上传过的文件会长期保存在路由器数据分区');
+  }
+}
+
+/** 用量条文案。搜索时按命中结果统计，并显式写出「命中 / 总数」。 */
+function renderUsage(total, list, searching) {
+  const sum = list.reduce((n, f) => n + (Number(f.size) || 0), 0);
+  setText($('#usageText'), searching
+    // 命中时体积只能自己加 —— 服务端给的是全量总和
+    ? list.length + ' / ' + total + ' 个文件 · 共 ' + humanSize(sum)
+    // 未搜索时直接用服务端的文案，本地不再算一遍（少一处可能对不上的口径）
+    : total + ' 个文件 · 共 ' + (state.filesTotalText || humanSize(sum)));
+  setText($('#usageHint'), state.user ? '长期保存在路由器数据分区' : '浏览与下载无需登录');
+}
+
 function renderFiles() {
   const body = $('#fileBody');
-  const empty = $('#fileEmpty');
   if (!body) return;
 
   body.innerHTML = '';
-  const list = state.files || [];
-  if (empty) empty.hidden = list.length > 0;
+  const all = state.files || [];
+  const tokens = searchTokens();
+  const list = tokens.length ? all.filter((f) => nameMatches(f.name, tokens)) : all;
+
+  renderFilesEmpty(all.length, list.length, tokens.length > 0);
+  renderUsage(all.length, list, tokens.length > 0);
 
   list.forEach((f) => {
     const tr = document.createElement('tr');
@@ -1637,7 +1766,9 @@ function renderFiles() {
     const nm = document.createElement('div');
     nm.className = 'fname';
     nm.title = f.name;
-    setText(nm, f.name);
+    // 搜索态下把命中的片段标出来，让用户一眼看出「为什么这条在这儿」。
+    const hl = highlightedName(f.name, tokens);
+    if (hl) nm.appendChild(hl); else setText(nm, f.name);
     // 双击就地改名。只有能改的人（本人或管理员）才挂监听 ——
     // 挂上去再在回调里判权限，双击时只会看到一个「看着能点、点了报错」的假入口。
     if (canDeleteFile(f)) {
@@ -1796,6 +1927,11 @@ function startRename(f, nm, tr) {
       }
       tr.classList.remove('is-busy');
       toast('已重命名为：' + f.name, 'ok');
+      // 搜索态下整表重绘：新名字可能不再命中（这一行该消失），
+      // 也可能换了个位置命中（高亮要跟着挪）。就地改文字两件都做不到，
+      // 会留下一条「明明不匹配却还在列表里」的幽灵行。
+      // 没有搜索词时不重绘 —— 那是纯粹的重建，只会闪一下。
+      if (trim(state.fileQuery)) renderFiles();
     } catch (_) {
       tr.classList.remove('is-busy');
       toast('网络错误，重命名失败', 'err');
@@ -2260,6 +2396,26 @@ function bindEvents() {
 
   // ---- 文件 ----
   $('#btnUpload').addEventListener('click', pickFiles);
+
+  // ---- 文件搜索（纯前端过滤，不请求服务端）----
+  const searchInput = $('#fileSearch');
+  if (searchInput) {
+    // 边打边过滤：列表已经在本地，重绘一次的成本远低于一次往返，
+    // 也就不需要防抖 —— 防抖反而会让打字快的人觉得卡。
+    searchInput.addEventListener('input', applySearch);
+    // Esc 清空搜索。这个键在输入框里没有别的语义，抢来当「退出搜索」最顺手。
+    // 停止冒泡：否则会顺带触发全局的 Esc（关弹窗），一次按键办两件事。
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && searchInput.value) {
+        e.preventDefault();
+        e.stopPropagation();
+        clearSearch();
+      }
+    });
+  }
+  const clearBtn = $('#btnClearSearch');
+  if (clearBtn) clearBtn.addEventListener('click', clearSearch);
+
   $('#btnLoginFromLock').addEventListener('click', () => {
     // 首次部署时直接切到注册，省掉一次点击。
     const needSetup = state.status && state.status.needSetup;
