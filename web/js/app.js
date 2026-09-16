@@ -155,7 +155,8 @@ const state = {
   room: null,            // 当前会话码
   ws: null,              // WebSocket 实例
   wsReady: false,
-  myName: '',            // 本连接的显示名 —— 完全由服务端分配（客户端 IP），见 hello.self
+  myName: '',            // 本连接的显示名 —— 服务端分配（真实客户端 IP），见 hello.self
+  myId: '',              // 本连接的唯一标识 —— 判定「这条是不是我发的」只能靠它，见 hello.selfId
   reconnectTimer: null,
   reconnectDelay: 1000,
   manualLeave: false,    // 主动退出时不要自动重连
@@ -695,6 +696,10 @@ function enterRoom(code, info) {
   closeLightbox();
   state.members = [];
   state.pendingSelf.clear();
+  // 换房间后旧身份一律作废：显示名与连接标识都以新连接的 hello 为准。
+  // 不清的话，新房间的第一帧历史回放会拿上一个房间的身份去判归属。
+  state.myName = '';
+  state.myId = '';
   renderMembers();
   renderTTL();
 
@@ -752,6 +757,8 @@ function leaveRoom(silent) {
   state.room = null;
   state.members = [];
   state.pendingSelf.clear();
+  state.myName = '';
+  state.myId = '';
   state.expiresAt = 0;
   state.ttlMinutes = 0;
   // 退出房间时丢掉待发送的图：它们只对当前房间有意义，
@@ -838,9 +845,12 @@ function handleWSEvent(data) {
   switch (data.event) {
     case 'hello':
       state.members = data.members || [];
-      // 服务端告知本连接的显示名。昵称留空时服务端会用 IP 兜底，
-      // 所以这里必须采用服务端的值，否则判断「这条是不是我发的」会永远不成立。
+      // 服务端告知本连接的显示名与唯一标识。
+      // myName 只用于展示与跨版本兜底；myId 才是判定消息归属的依据 ——
+      // 显示名在同一 IP 的多个连接之间会重名（服务端只保证房间内不重名，
+      // 会追加 " #2" 之类后缀），id 才是真正唯一的。
       if (data.self) state.myName = data.self;
+      if (data.selfId) state.myId = data.selfId;
       // 房间存活信息以服务端为准：加入别人的房间时本地并不知道剩余时间。
       if (typeof data.expiresAt === 'number') state.expiresAt = data.expiresAt;
       if (typeof data.remainingSeconds === 'number') {
@@ -987,6 +997,7 @@ function sendMessage() {
     type,
     content,
     sender: state.myName || '我',
+    senderId: state.myId,
     sentAt: Date.now(),
     optimistic: true
   };
@@ -1368,12 +1379,15 @@ function closeLightbox() {
  * @param animate   是否播放入场动画
  * @param optimistic 是否是本地乐观渲染（此刻还没有服务端 id）
  * @param mineHint  显式指定「是我发的」。服务端回显替换乐观节点时会用到：
- *                  那一刻 cid 已从 pendingSelf 移除，靠 cid 或 sender 都判不出来。
+ *                  那一刻 cid 已从 pendingSelf 移除，直接给出结论最省事
+ *                  （回显带着本连接的 senderId，其实也判得出来）。
  *
- * mine 的判定顺序：显式提示 > 乐观渲染 > cid 命中 > sender 比较。
- * 最后一条只是兜底（比如刷新后收到历史回放），不能单独依赖：
- * 同一台机器开两个标签页时服务端给出的是同一个 IP，
- * 光比 sender 分不清「我发的」和「另一个标签页发的」。
+ * mine 的判定顺序：显式提示 > 乐观渲染 > cid 命中 > senderId 比较 > 名字兜底。
+ *
+ * 权威依据是 senderId（服务端给**连接**分配的唯一标识）：
+ * 显示名不足以判定归属 —— 同一台机器开两个标签页、或所有人经由同一个
+ * 反向代理进来时，服务端算出的显示名会完全重名，按名字比会把别人的
+ * 消息全认成自己的（历史上实时区「消息全显示成我」就是这么来的）。
  */
 function appendMessage(m, animate, optimistic, mineHint) {
   const box = $('#messages');
@@ -1382,8 +1396,11 @@ function appendMessage(m, animate, optimistic, mineHint) {
   const mine = mineHint === true
     || optimistic === true
     || (!!m.cid && state.pendingSelf.has(m.cid))
-    || (!!state.myName && m.sender === state.myName);
-  const follow = nearBottom(box);
+    || (!!state.myId && m.senderId === state.myId)
+    // 兜底：老服务端不下发 senderId 时退回按名字比。
+    // 它在重名场景下必定误判，只作为跨版本兼容保留。
+    || (!m.senderId && !!state.myName && m.sender === state.myName);
+  const follow = nearBottom();
 
   const el = document.createElement('div');
   el.className = 'msg'
@@ -2076,6 +2093,7 @@ function sendOneChatFile(file, ui) {
         type: 'file',
         content: data.name,
         sender: state.myName || '我',
+        senderId: state.myId,
         sentAt: Date.now(),
         fileName: data.name,
         fileSize: data.size,

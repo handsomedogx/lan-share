@@ -153,10 +153,14 @@ func TestConcurrentJoinLeaveAndBroadcast(t *testing.T) {
 }
 
 // fakeClient 是 session.Client 的最小实现，用于并发测试。
+//
+// 展示名带独立锁：Join 会改写它，而广播/fan-out 会在别的 goroutine 里
+// 通过 Labels() 读它 —— 不加锁就是一处于 data race。
 type fakeClient struct {
-	label string
-	mu    sync.Mutex
-	got   int
+	labelMu sync.RWMutex
+	label   string
+	mu      sync.Mutex
+	got     int
 }
 
 func (c *fakeClient) Send([]byte) {
@@ -165,4 +169,14 @@ func (c *fakeClient) Send([]byte) {
 	c.mu.Unlock()
 }
 
-func (c *fakeClient) Label() string { return c.label }
+func (c *fakeClient) Label() string {
+	c.labelMu.RLock()
+	defer c.labelMu.RUnlock()
+	return c.label
+}
+
+func (c *fakeClient) SetLabel(s string) {
+	c.labelMu.Lock()
+	c.label = s
+	c.labelMu.Unlock()
+}

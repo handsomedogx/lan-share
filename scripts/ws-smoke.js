@@ -1,8 +1,11 @@
 /**
- * 一次性 WebSocket 冒烟测试：验证 cid 回传、去重链路，以及房间号 / 存活时长。
+ * 一次性 WebSocket 冒烟测试：验证 cid 回传、去重链路、身份归属，
+ * 以及房间号 / 存活时长。
  *
- * 为什么用 Node 而不是 Go：本机 Go 已被用户挪走，无法编译 Go 测试客户端。
- * Node 自带 crypto/net，手写最小 RFC 6455 客户端即可，零依赖。
+ * 为什么用 Node 而不是 Go：Node 自带 crypto/net，手写最小 RFC 6455
+ * 客户端即可，零依赖，也不用为测试再往仓库里塞一个 Go 测试客户端。
+ * 而且它能直接构造自定义请求头 —— 验证「反代场景下显示名取真实来源」
+ * 这条恰恰需要伪造 X-Forwarded-For。
  *
  * 用法： node scripts/ws-smoke.js [端口] [会话码]
  *   会话码留空则自动创建一个。
@@ -133,8 +136,15 @@ function httpRawLogin(method, path, cookie) {
 
 /** 最小 RFC 6455 客户端：只做文本帧收发，够验证用。 */
 class WS {
-  constructor(path) {
+  /**
+   * @param path    握手路径，例如 /ws/session/ABCD
+   * @param headers 额外请求头。用于模拟反向代理透传真实来源
+   *                （X-Forwarded-For / X-Real-IP）—— 浏览器的
+   *                WebSocket 构造函数设不了头，只有手写握手才能造出来。
+   */
+  constructor(path, headers) {
     this.path = path;
+    this.headers = headers || null;
     this.sock = null;
     this.buf = Buffer.alloc(0);
     this.handlers = [];
@@ -146,6 +156,10 @@ class WS {
   connect() {
     return new Promise((resolve, reject) => {
       const key = crypto.randomBytes(16).toString('base64');
+      let extra = '';
+      if (this.headers) {
+        for (const k of Object.keys(this.headers)) extra += k + ': ' + this.headers[k] + '\r\n';
+      }
       this.sock = net.connect(PORT, HOST, () => {
         this.sock.write(
           `GET ${this.path} HTTP/1.1\r\n`
@@ -153,7 +167,9 @@ class WS {
           + 'Upgrade: websocket\r\n'
           + 'Connection: Upgrade\r\n'
           + `Sec-WebSocket-Key: ${key}\r\n`
-          + 'Sec-WebSocket-Version: 13\r\n\r\n'
+          + 'Sec-WebSocket-Version: 13\r\n'
+          + extra
+          + '\r\n'
         );
       });
       this.sock.on('error', reject);
@@ -395,6 +411,55 @@ function check(name, cond, detail) {
   check('self 与 members 一致', (hello.members || []).includes(hello.self),
     'self=' + hello.self + ' members=' + JSON.stringify(hello.members));
   console.log('  服务端分配的显示名:', hello.self, '\n');
+
+  console.log('--- 1.5 身份唯一化与消息归属 ---');
+  // 这一段防的是实测踩到的真实故障：
+  //   显示名默认由客户端 IP 兜底，而部署形态是 nginx 反代
+  //   （局域网 → nginx:80 → 127.0.0.1:18080），WebSocket 握手 Hijack 之后
+  //   底层连接的对端**永远是 nginx 自己**。于是房间里每个人的显示名都相同，
+  //   前端又按「sender == 我的名字」判「这条是不是我发的」——
+  //   结果所有人的消息都被标成「我」。
+  // 现在服务端保证两件事：名字在房间内唯一化；每条消息带发送连接的 senderId。
+  check('hello 带 selfId', typeof hello.selfId === 'string' && hello.selfId.length > 0,
+    'selfId=' + JSON.stringify(hello.selfId));
+
+  // 同一 IP 的第二个连接（同机双开 / 同一个反代后面）。
+  const wsB = new WS('/ws/session/' + code);
+  await wsB.connect();
+  const helloB = await waitFor(wsB, (e) => e.event === 'hello', 'helloB');
+  check('同 IP 的第二个连接拿到不重名的显示名', helloB.self !== hello.self,
+    'a=' + hello.self + ' b=' + helloB.self);
+  check('唯一化后的名字以原名做前缀（便于人眼对应）',
+    helloB.self.startsWith(hello.self), 'b=' + helloB.self);
+  check('两个连接的 selfId 不同', helloB.selfId !== hello.selfId,
+    'a=' + hello.selfId + ' b=' + helloB.selfId);
+  check('在线名单同时列出两个人', (helloB.members || []).length === 2,
+    JSON.stringify(helloB.members));
+
+  // B 发的消息：A 必须能凭 senderId 认出「这不是我发的」。
+  const fromBP = waitFor(ws, (e) => e.event === 'message'
+    && e.message && e.message.content === '来自B的消息', 'B 的消息');
+  wsB.send({ type: 'text', content: '来自B的消息' });
+  const fromB = await fromBP;
+  check('B 的消息 sender 用的是 B 的唯一名', fromB.message.sender === helloB.self,
+    'sender=' + fromB.message.sender);
+  check('B 的消息带 senderId（= B 的 selfId）',
+    fromB.message.senderId === helloB.selfId, 'senderId=' + fromB.message.senderId);
+  check('A 凭 senderId 不会把 B 的消息认成自己发的',
+    fromB.message.senderId !== hello.selfId);
+
+  // 反代形态：服务端应采信 X-Forwarded-For，而不是把 nginx 的地址当人名。
+  const wsC = new WS('/ws/session/' + code, { 'X-Forwarded-For': '192.168.1.77' });
+  await wsC.connect();
+  const helloC = await waitFor(wsC, (e) => e.event === 'hello', 'helloC');
+  check('反代下显示名取 X-Forwarded-For 里的真实来源',
+    helloC.self === '192.168.1.77', 'self=' + helloC.self);
+  check('两条不同来源的连接 selfId 也不同', helloC.selfId !== hello.selfId);
+
+  wsB.close();
+  wsC.close();
+  await new Promise((r) => setTimeout(r, 200));
+  console.log('');
 
   console.log('--- 2. 带 cid 发送，验证原样回传 ---');
   const cid = 'c-test-' + Date.now();

@@ -1,6 +1,9 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -180,6 +184,11 @@ type wsOut struct {
 	// 必须下发，否则前端无从知道自己叫什么 —— 昵称留空时服务端会用 IP 兜底，
 	// 前端若还按空昵称去匹配 sender，就会把自己的消息当成别人的，导致重复渲染。
 	Self string `json:"self,omitempty"`
+	// SelfID 是本连接的唯一标识，与 Message.SenderID 同源。
+	//
+	// 前端必须用它（而不是 Self）判断消息归属：Self 只是显示名，
+	// 在同一 IP 的多个连接之间会重名（同机双开、反向代理场景）。
+	SelfID string `json:"selfId,omitempty"`
 	// ExpiresAt / RemainingSeconds 描述房间存活情况，前端据此显示倒计时。
 	// RemainingSeconds 为 -1 表示没有到期时间（兜底场景）；只在 hello 里下发。
 	ExpiresAt        int64  `json:"expiresAt,omitempty"`
@@ -189,9 +198,15 @@ type wsOut struct {
 
 // wsClient 是 session.Client 的实现，桥接 Conn 与房间广播。
 type wsClient struct {
-	conn  *websocket.Conn
-	label string
-	code  string
+	conn *websocket.Conn
+	code string
+	// id 是本连接的唯一标识。随 hello.selfId 下发，并写进它发出的
+	// 每条消息的 senderId —— 前端据此判定「这条是不是我发的」。
+	id string
+	// label 是展示名。它会在 Room.Join 时被唯一化改写，而广播协程、
+	// 消息构造协程都会读它，所以读写一律走 labelMu。
+	labelMu sync.RWMutex
+	label   string
 	// ch 是该连接的发送队列。所有下发都先入队再写出，
 	// 保证「写」永远只有一个 goroutine，避免并发写坏帧。
 	ch     chan []byte
@@ -212,7 +227,19 @@ func (c *wsClient) Send(b []byte) {
 }
 
 // Label 实现 session.Client。
-func (c *wsClient) Label() string { return c.label }
+func (c *wsClient) Label() string {
+	c.labelMu.RLock()
+	defer c.labelMu.RUnlock()
+	return c.label
+}
+
+// SetLabel 实现 session.Client：由 Room.Join 在房间锁内调用，
+// 把展示名改成房间内唯一的值（同名时追加 " #2"）。
+func (c *wsClient) SetLabel(s string) {
+	c.labelMu.Lock()
+	c.label = s
+	c.labelMu.Unlock()
+}
 
 // handleWS 处理 GET /ws/session/{code}。
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -251,25 +278,39 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 显示名优先取 ?name=，留空则用客户端 IP 兜底。
+	// 显示名优先取 ?name=，留空则按客户端 IP 兜底。
+	//
+	// IP 必须走 httpx.ClientIP 而不是 conn.RemoteAddr()：本项目的部署形态是
+	// nginx(10.0.0.1:80) → 127.0.0.1:18080 的反向代理（见 deploy/），
+	// 而 Hijack 之后的底层连接对端**永远是 nginx 自己**。用它当兜底名，
+	// 房间里每个人的显示名都会变成同一个 "127.0.0.1"，
+	// 「这条消息是谁发的」也就彻底无从区分 —— 这是实测踩到的真实故障。
+	// ClientIP 会优先读 nginx 传来的 X-Forwarded-For / X-Real-IP。
 	//
 	// 当前网页端已不再提供昵称输入框（显示名统一由服务端分配），
 	// 但查询参数保留：它是 URL 契约的一部分，脚本或其他客户端仍可直接指定。
+	//
+	// 安全性：XFF 可以伪造，但这条路径只影响**显示名** ——
+	// 消息归属由 senderId 判定（见 Message.SenderID），
+	// 所以冒名顶替最多让成员列表上出现一个假名字，不会让人误认消息出自自己。
 	label := r.URL.Query().Get("name")
 	if label == "" {
-		label = defaultLabel(conn.RemoteAddr())
+		label = httpx.ClientIP(r)
 	}
 	label = sanitizeLabel(label)
 
 	client := &wsClient{
 		conn:   conn,
-		label:  label,
 		code:   code,
+		id:     newClientID(),
 		ch:     make(chan []byte, 64),
 		closed: make(chan struct{}),
 	}
+	client.label = label
 
-	room.Join(client)
+	// Join 会把名字在房间内唯一化（重名追加 " #2"），返回值才是最终名。
+	// 后续的日志、hello.self、消息 sender 都必须用这个值。
+	label = room.Join(client)
 
 	// 下发 hello：带上在线名单与历史消息（刷新页面后能看到刚才的内容）。
 	history := room.History()
@@ -281,6 +322,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		Event:            "hello",
 		Code:             code,
 		Self:             label,
+		SelfID:           client.id,
 		Online:           room.Online(),
 		Members:          room.Labels(),
 		History:          history,
@@ -395,12 +437,13 @@ func (s *Server) handleClientMessage(room *session.Room, client *wsClient, data 
 	}
 
 	msg := session.Message{
-		ID:      newMsgID(),
-		Type:    msgType,
-		Content: content,
-		Sender:  client.label,
-		SentAt:  time.Now().UnixMilli(),
-		Cid:     in.Cid,
+		ID:       newMsgID(),
+		Type:     msgType,
+		Content:  content,
+		Sender:   client.Label(),
+		SenderID: client.id,
+		SentAt:   time.Now().UnixMilli(),
+		Cid:      in.Cid,
 	}
 	// 只把不带 cid 的副本写进历史：历史回放不需要去重语义，
 	// 而且别人的 cid 对后来者毫无意义。
@@ -441,7 +484,8 @@ func (s *Server) handleFileMessage(room *session.Room, client *wsClient, in wsIn
 		ID:       newMsgID(),
 		Type:     "file",
 		Content:  f.OriginalName,
-		Sender:   client.label,
+		Sender:   client.Label(),
+		SenderID: client.id,
 		SentAt:   time.Now().UnixMilli(),
 		FileName: f.OriginalName,
 		FileSize: f.Size,
@@ -495,19 +539,21 @@ func newMsgID() string {
 	return strconv.FormatInt(time.Now().UnixMilli(), 36) + "-" + strconv.FormatUint(seq, 36)
 }
 
-// defaultLabel 在用户没有指定昵称时生成一个稳定的默认名。
-func defaultLabel(remoteAddr string) string {
-	ip := remoteAddr
-	for i := len(ip) - 1; i >= 0; i-- {
-		if ip[i] == ':' {
-			ip = ip[:i]
-			break
-		}
+// newClientID 生成一个连接级的唯一标识（8 位十六进制）。
+//
+// 它随 hello.selfId 下发、并写进该连接发出的每条消息的 senderId，
+// 前端靠「senderId == selfId」回答「这条是不是我发的」。
+//
+// 用随机值而不是递增序号：重连窗口里前端的 state 可能还留着上一条
+// 连接的标识，随机值不会像序号那样在重连后重新撞上。
+// 它只在单个房间内参与比较，不需要全局唯一。
+func newClientID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand 失败极其罕见，退化为时间戳低 32 位。
+		binary.BigEndian.PutUint32(b[:], uint32(time.Now().UnixNano()))
 	}
-	if ip == "" {
-		return "匿名设备"
-	}
-	return ip
+	return hex.EncodeToString(b[:])
 }
 
 // sanitizeLabel 清洗昵称，去掉控制字符并限长。

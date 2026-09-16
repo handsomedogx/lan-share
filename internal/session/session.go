@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,7 +75,14 @@ type Message struct {
 	Type    string `json:"type"` // text | link | file
 	Content string `json:"content"`
 	Sender  string `json:"sender"`
-	SentAt  int64  `json:"sentAt"` // Unix 毫秒
+	// SenderID 是发送方**连接**的唯一标识（见 wsOut.SelfID 的对侧说明）。
+	//
+	// 「这条是不是我发的」只能靠它判定。显示名（Sender）在同一台机器开
+	// 两个标签页、或所有连接都经由同一个反向代理进来时会完全重名，
+	// 靠名字比较必然把别人的消息认成自己的 —— 这正是实时区早期
+	// 「所有消息都显示成我」的根因。
+	SenderID string `json:"senderId,omitempty"`
+	SentAt   int64  `json:"sentAt"` // Unix 毫秒
 	// 以下四个字段仅 type=file 时有值。
 	// 文件本体不经过 WebSocket（大文件会把内存和带宽都吃掉），
 	// 这里只传「叫什么、多大、去哪儿下」。
@@ -100,7 +108,12 @@ type Client interface {
 	// Send 向该连接投递一条消息。
 	Send(msg []byte)
 	// Label 返回该连接的展示名（用于在线列表）。
+	//
+	// 名字可能被 Join 唯一化改写，而广播、消息构造会在**其他 goroutine**
+	// 里读它，因此实现方必须保证并发安全。
 	Label() string
+	// SetLabel 由 Room.Join 在房间锁内调用：把展示名改成房间内唯一的值。
+	SetLabel(string)
 }
 
 // Room 是一个授权码会话。
@@ -488,12 +501,45 @@ func (m *Manager) isRetiring(code string) bool {
 
 // ---------------------------------------------------------------- Room
 
-// Join 把一个连接加入房间。
-func (r *Room) Join(c Client) {
+// Join 把一个连接加入房间，返回它在房间内的**最终**展示名。
+//
+// 显示名在这里被唯一化：与房间内已有的名字冲突时依次追加 " #2"、" #3"。
+//
+// 为什么必须做：展示名默认由客户端 IP 兜底，而「同一台机器开两个标签页」
+// 和「所有设备都经由同一个反向代理进来」这两种再普通不过的场景下，
+// 所有人的 base 名都完全相同。不唯一化的话，在线列表会把两个人合成
+// 一个条目（Labels 去重），前端也无法回答「这条是不是我发的」。
+//
+// 调用方拿到的返回值才是权威名字：client.Sender 与日志都必须用它，
+// 而不是 Join 之前那个可能已被改写的 base。
+func (r *Room) Join(c Client) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	label := r.uniqueLabelLocked(c.Label())
+	c.SetLabel(label)
 	r.clients[c] = struct{}{}
 	r.lastSeen = time.Now()
+	return label
+}
+
+// uniqueLabelLocked 返回一个当前房间内未被占用的展示名。
+// 调用者必须已持有 r.mu（写锁）。
+func (r *Room) uniqueLabelLocked(base string) string {
+	taken := make(map[string]struct{}, len(r.clients))
+	for c := range r.clients {
+		taken[c.Label()] = struct{}{}
+	}
+	if _, ok := taken[base]; !ok {
+		return base
+	}
+	// 从 #2 开始试，撞上就继续往后 —— 房间人数有限，这个循环必然终止。
+	for i := 2; ; i++ {
+		cand := base + " #" + strconv.Itoa(i)
+		if _, ok := taken[cand]; !ok {
+			return cand
+		}
+	}
 }
 
 // Leave 把一个连接移出房间。
@@ -523,6 +569,9 @@ func (r *Room) Clients() []Client {
 }
 
 // Labels 返回在线用户展示名列表（去重）。
+//
+// 名字在 Join 时已被唯一化，正常不会重复；保留去重是为了不依赖
+// 「唯一化一定生效」这个外部不变量 —— 那属于 Join 的职责，不是这里的。
 func (r *Room) Labels() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
