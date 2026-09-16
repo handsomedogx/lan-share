@@ -110,6 +110,35 @@ async function copyText(text) {
   }
 }
 
+/**
+ * 「谁在滚」—— 桌面端是 .messages 自己（它是 overflow:auto 的滚动盒），
+ * 窄屏（≤1000px）CSS 把它改成 overflow:visible，滚的是整个文档。
+ *
+ * 这里刻意用**实测**而不是拿 window.innerWidth 去比断点：断点写在 CSS 里，
+ * 两边各写一份迟早对不上；而且即使桌面端，消息少到不溢出时 .messages
+ * 也不是滚动容器，这时该滚的同样是文档。
+ */
+function scrollHost() {
+  const box = $('#messages');
+  const doc = document.scrollingElement || document.documentElement;
+  if (!box) return doc;
+  const oy = getComputedStyle(box).overflowY;
+  if ((oy === 'auto' || oy === 'scroll') && box.scrollHeight > box.clientHeight) return box;
+  return doc;
+}
+
+/** 当前滚动位置离「消息的底」还有多少 px（负数=已经越过）。 */
+function distanceFromBottom() {
+  const host = scrollHost();
+  if (host === (document.scrollingElement || document.documentElement)) {
+    // 整页滚动时，要盯的不是文档底部（那是文件仓库），而是实时面板的底 ——
+    // 也就是输入框那一带；滚过头会把最新消息顶出屏幕。
+    const pane = $('#livePane');
+    return pane ? pane.getBoundingClientRect().bottom - window.innerHeight : 0;
+  }
+  return host.scrollHeight - host.scrollTop - host.clientHeight;
+}
+
 /** 节流的 requestAnimationFrame 包装，用于滚动到底部。 */
 let scrollScheduled = false;
 function scheduleScrollBottom() {
@@ -117,15 +146,21 @@ function scheduleScrollBottom() {
   scrollScheduled = true;
   requestAnimationFrame(() => {
     scrollScheduled = false;
-    const box = $('#messages');
-    if (box) box.scrollTop = box.scrollHeight;
+    const host = scrollHost();
+    if (host === (document.scrollingElement || document.documentElement)) {
+      const pane = $('#livePane');
+      if (!pane) return;
+      const edge = pane.getBoundingClientRect().bottom + window.scrollY;
+      window.scrollTo(0, Math.max(0, edge - window.innerHeight));
+      return;
+    }
+    host.scrollTop = host.scrollHeight;
   });
 }
 
 /** 判断消息区是否已经在底部附近（用于决定要不要自动跟随滚动）。 */
-function nearBottom(box, slack) {
-  if (!box) return true;
-  return box.scrollHeight - box.scrollTop - box.clientHeight <= (slack == null ? 80 : slack);
+function nearBottom(slack) {
+  return distanceFromBottom() <= (slack == null ? 80 : slack);
 }
 
 /** 取名字首字符作为头像文字。 */

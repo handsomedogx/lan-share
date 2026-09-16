@@ -452,6 +452,11 @@ button, input, textarea { font: inherit; color: inherit; }
   flex-direction: column;
   gap: 4px;
   max-width: 88%;
+  /* 别被 .messages 的 align-items: stretch 拉满整行 —— 它就是「对方消息」
+   * 一条条变成整宽灰条的原因。flex-start 让宽度回到「内容决定」，
+   * max-width: 88% 依旧封顶，长文本照常在此换行。
+   * 自己的消息在下面用 flex-end 覆盖（右对齐 + 同样收缩到内容宽度）。 */
+  align-self: flex-start;
   animation: msg-in .18s ease-out;
 }
 @keyframes msg-in {
@@ -482,8 +487,15 @@ button, input, textarea { font: inherit; color: inherit; }
   white-space: pre-wrap;
   font-size: 13.5px;
   line-height: 1.6;
+  /* 气泡宽度只跟自己的内容走。
+   * 光给 .msg 加 align-self 还不够：.msg 的宽度是「子项里最宽的那个」决定的，
+   * 上面那行「发送者 · 时间」（font-size 11px 也要 80~90px）比短消息本身宽，
+   * 于是 "hi" 和 "hello" 会被撑成一样宽 —— 看着像固定宽度，其实是被头部撑的。
+   * 让 .msg-body 自己收缩，头部行该多宽就多宽，气泡只认文本。 */
+  align-self: flex-start;
 }
 .msg.is-mine .msg-body {
+  align-self: flex-end;
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
@@ -742,9 +754,9 @@ button, input, textarea { font: inherit; color: inherit; }
   .msg-image-dl { opacity: 1; }   /* 触屏没有 hover，直接常显 */
 }
 
-/* 图片气泡的宽度交给内容决定（否则 max-width:88% 会把窄图拉成一条空边）。
- * 注意 .msg 自身的 max-width 仍是 88%，这里只是允许它小于那个值。 */
-.msg.is-image { width: auto; }
+/* 图片气泡的宽度同样交给内容决定，靠的是 .msg 的 align-self: flex-start
+ * （早先这里用 .msg.is-image{width:auto} 兜过同一个症状，其实根因是
+ *  .messages 的默认 align-items: stretch，见 .msg 处注释）。 */
 
 /* ---------------------------------------------------------------- 灯箱 */
 .lightbox {
@@ -1373,15 +1385,43 @@ button, input, textarea { font: inherit; color: inherit; }
 .toast.is-info .toast-icon { color: var(--accent); }
 
 /* ---------------------------------------------------------------- 响应式 */
+/* 窄屏（手机 / 竖着的平板）改成「整页滚动」。
+ * 这里踩过两个坑，改之前先看这段：
+ *   1) 原来窄屏只把 .layout 换成单列，行高仍是 minmax(320px, 1fr) —— 把聊天区
+ *      和文件列表都挤成「有界的盒子」，于是它们各自成了内层滚动容器；
+ *      而 .messages 还带着 overscroll-behavior: contain，手指从聊天区往下拉时
+ *      手势被内层吃掉、到边界也不往上传 —— 表现就是「滑动聊天区域，页面不动」。
+ *   2) body 当时是 height:100% + overflow:auto 的滚动盒。iOS 上 body 当滚动容器
+ *      本身就有 URL 栏抖动那套毛病，不如把高度交给内容、让文档自己滚。
+ *
+ * 所以窄屏的唯一滚动容器是文档：html/body 交出固定高度，内层一律 overflow: visible。
+ */
 @media (max-width: 1000px) {
+  html, body { height: auto; }
+  body { overflow: visible; }
+
   .layout {
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(320px, 1fr) minmax(280px, .85fr);
+    /* 行高由内容决定，min 值只是「别太寒碜」的地板 ——
+       写死 1fr 就又变回有界盒子了（见上）。 */
+    grid-template-rows: minmax(320px, auto) minmax(280px, auto);
     gap: 12px;
     padding: 12px;
+    flex: 1 0 auto;
   }
-  body { overflow: auto; }
-  .layout { flex: 1 0 auto; }
+
+  /* 消息区不再自建滚动条：整页只有一个滚动容器，手指从哪儿拉页面都跟着走 */
+  .messages {
+    flex: 0 0 auto;
+    overflow: visible;
+    overscroll-behavior: auto;
+  }
+
+  /* 文件列表同理 */
+  .file-scroll { flex: 0 0 auto; overflow: visible; }
+  /* 表头 sticky 的吸附基准原本是 .file-scroll；它不再是滚动容器后，
+     表头会吸到视口顶上跟着整页飘，不如在窄屏直接取消吸附。 */
+  .file-table thead th { position: static; }
 }
 
 @media (max-width: 620px) {
