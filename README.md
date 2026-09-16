@@ -248,6 +248,19 @@ nginx -t && /etc/init.d/nginx reload
 
 之后访问 `http://10.0.0.1/`。
 
+> **`/tmp` 在 OpenWrt / Kwrt 上通常是 tmpfs（内存盘）。**
+> 所以 `deploy/nginx-lan-share.conf` 里显式关掉了请求体缓冲 ——
+> 否则大文件上传会被 nginx 先缓存到 RAM，低内存路由器可能 OOM、甚至整机失去响应：
+
+```nginx
+proxy_request_buffering off;   # 请求体不落 nginx 的临时目录，直接透传
+proxy_buffering off;           # 响应侧同理
+```
+
+> 这跟 `client_max_body_size 0` 是两件事：那个决定**放不放行**，
+> 这个决定**放行之后数据先去哪儿**。照抄别处的 nginx 配置时，
+> 很容易只搬走前者而漏掉这两行。
+
 ### 5. 创建第一个用户
 
 **第一个注册的人自动成为管理员**，不需要命令行。浏览器打开页面会自动引导你注册：
@@ -1063,3 +1076,4 @@ go test ./... -v
 
 **落点指示不要参与布局。** 遮罩用绝对定位的 `.drop-veil`（`position: absolute` 覆盖整个面板），
 而不是往 flex 行里插真实元素 —— 后者会让光标附近的元素位移，触发来回抖动。
+
