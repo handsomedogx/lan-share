@@ -60,7 +60,7 @@ type Options struct {
 	// 刻意不再回落到 MaxUpload：两个变量必须完全独立，
 	// 否则会出现「LANSHARE_CHAT_UPLOAD_MB=0 本意是不限，
 	// 却被仓库上限接管」这种违反直觉的行为。
-	// 默认值由 config.Load() 自己负责（当前是 100MB）。
+	// 默认值由 config.Load() 自己负责（当前是 500MB）。
 	ChatMaxUpload int64
 	// UploadConcurrency 是同时允许的上传数，<=0 表示不限。
 	UploadConcurrency int

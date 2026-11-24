@@ -80,15 +80,15 @@ const (
 	// 两边保持一致，正常使用时就不会撞到服务端排队。
 	DefaultUploadConcurrency = 2
 
-	// DefaultChatMaxUpload 是聊天室单文件默认上限（100 MB）。
+	// DefaultChatMaxUpload 是聊天室单文件默认上限（500 MB）。
 	//
-	// 选 100MB 的理由：局域网内几百兆的安装包也常见，
-	// 但聊天室文件随房间消失、不适合当网盘用，所以给一个
-	// 「够传文档、图片、小压缩包」的克制值。
-	DefaultChatMaxUpload int64 = 100 * 1024 * 1024
+	// 选 500MB 的理由：已迁到本地台式机运行后内存与磁盘都很充裕，
+	// 局域网内常见几百兆的安装包或打包文件都可以直接随手传，
+	// 同时仍保留上限避免把即时房间当成无限网盘。
+	DefaultChatMaxUpload int64 = 500 * 1024 * 1024
 )
 
-// Load 从环境变量读取配置，未设置的项使用适合路由器的默认值。
+// Load 从环境变量读取配置，未设置的项使用默认值。
 //
 // 支持的变量：
 //
@@ -99,11 +99,11 @@ const (
 //	LANSHARE_LOG            日志文件路径
 //	LANSHARE_MAX_UPLOAD_MB  文件仓库单次上传上限（MB），0 或留空表示不限制
 //	LANSHARE_CHAT_UPLOAD_MB 聊天室单文件上限（MB），0 表示聊天室不限制，
-//	                        留空用 DefaultChatMaxUpload（100 MB）
+//	                        留空用 DefaultChatMaxUpload（500 MB）
 //
 // 两个上传上限**完全独立**：各自解析、各自生效，互不回落、互不覆盖。
 // 早先的实现会把「未配置」当成「用另一个变量的值」，于是
-// 「仓库不限 + 聊天室 100MB」这个最常见的组合根本表达不出来 ——
+// 「仓库不限 + 聊天室 500MB」这个最常见的组合根本表达不出来 ——
 // 现在 LANSHARE_CHAT_UPLOAD_MB=0 就是聊天室不限，不会再被仓库的值顶掉。
 //
 //	LANSHARE_UPLOAD_CONCURRENCY 服务端同时处理的上传数，0 表示不限，默认 2
@@ -118,7 +118,7 @@ func Load() (*Config, error) {
 		LogPath:            env("LANSHARE_LOG", filepath.Join(root, "logs", "lan-share.log")),
 		TmpDir:             env("TMPDIR", filepath.Join(root, "tmp")),
 		SessionTTL:         30 * 24 * 3600,       // 30 天
-		ChatMaxUploadBytes: DefaultChatMaxUpload, // 100 MB
+		ChatMaxUploadBytes: DefaultChatMaxUpload, // 500 MB
 		UploadConcurrency:  DefaultUploadConcurrency,
 	}
 
