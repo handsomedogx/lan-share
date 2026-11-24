@@ -640,6 +640,7 @@ function currentTTL() {
 
 /** 提交创建房间表单。 */
 async function doCreate() {
+  if ($('#btnDoCreate').disabled) return;
   const btn = $('#btnDoCreate');
   const code = trim($('#createCode').value).toUpperCase();
 
@@ -649,60 +650,104 @@ async function doCreate() {
     return;
   }
 
+  const data = await createSession(code, currentTTL(), btn, $('#createMsg'));
+  if (!data) return;
+  closeCreate();
+  toast('房间已创建：' + data.code, 'ok');
+  enterRoom(data.code, data);
+}
+
+/** 两个创建入口共用请求、错误提示和防重复提交。 */
+async function createSession(code, ttlMinutes, btn, hint) {
   btn.disabled = true;
-  setText($('#createMsg'), '');
+  setText(hint, '');
   try {
     const res = await fetch('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, ttlMinutes: currentTTL() })
+      body: JSON.stringify({ code, ttlMinutes })
     });
     const data = await res.json().catch(() => ({}));
     if (res.status === 409) {
-      setText($('#createMsg'), '该房间号已被占用，换一个吧');
+      setText(hint, '该房间号已被占用，请直接加入或换一个');
       return;
     }
     if (!res.ok) {
-      setText($('#createMsg'), data.error || '创建房间失败');
+      setText(hint, data.error || '创建房间失败');
       return;
     }
-    closeCreate();
-    toast('房间已创建：' + data.code, 'ok');
-    enterRoom(data.code, data);
+    return data;
   } catch (_) {
-    setText($('#createMsg'), '网络错误，无法创建房间');
+    setText(hint, '网络错误，无法创建房间');
   } finally {
     btn.disabled = false;
   }
 }
 
+let joinRequest = 0;
+
+function resetJoinFeedback() {
+  joinRequest++;
+  setText($('#joinHint'), '');
+  const btn = $('#btnCreateMissing');
+  btn.hidden = true;
+  delete btn.dataset.code;
+}
+
+async function createMissingSession() {
+  const btn = $('#btnCreateMissing');
+  const code = btn.dataset.code;
+  if (btn.hidden || btn.disabled || !code) return;
+  const input = $('#joinCode');
+  const joinBtn = $('#btnJoin');
+  input.disabled = true;
+  joinBtn.disabled = true;
+  try {
+    const data = await createSession(code, FALLBACK_TTL, btn, $('#joinHint'));
+    if (!data) return;
+    resetJoinFeedback();
+    toast('房间已创建：' + data.code, 'ok');
+    enterRoom(data.code, data);
+  } finally {
+    input.disabled = false;
+    joinBtn.disabled = false;
+  }
+}
+
 /** 加入会话（先查一次是否存在，给出更友好的错误）。 */
 async function joinSession() {
+  const btn = $('#btnJoin');
+  if (btn.disabled) return;
   const code = trim($('#joinCode').value).toUpperCase();
   const hint = $('#joinHint');
-  setText(hint, '');
+  resetJoinFeedback();
+  const request = joinRequest;
 
   if (!/^[A-Z0-9]{4,8}$/.test(code)) {
     setText(hint, '房间号为 4 - 8 位字母或数字');
     return;
   }
 
-  const btn = $('#btnJoin');
   btn.disabled = true;
   try {
     const res = await fetch('/api/sessions/' + encodeURIComponent(code));
-    if (res.status === 404) {
+    if (request !== joinRequest) return;
+    if (res.status === 404 || res.status === 410) {
       setText(hint, '房间不存在、已过期或已结束');
+      const createBtn = $('#btnCreateMissing');
+      createBtn.dataset.code = code;
+      createBtn.hidden = false;
       return;
     }
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
+      if (request !== joinRequest) return;
       setText(hint, data.error || '无法加入该房间');
       return;
     }
     enterRoom(code);
   } catch (_) {
-    setText(hint, '网络错误，请重试');
+    if (request === joinRequest) setText(hint, '网络错误，请重试');
   } finally {
     btn.disabled = false;
   }
@@ -710,6 +755,7 @@ async function joinSession() {
 
 /** 进入房间：更新 UI 并建立 WebSocket。 */
 function enterRoom(code, info) {
+  resetJoinFeedback();
   state.room = code;
   state.manualLeave = false;
   // 显示名完全由服务端分配（用客户端 IP 兜底），本地不再收集昵称。
@@ -1379,6 +1425,49 @@ function buildImageCard(m) {
 
 /* --------------------------------------------------------------- 灯箱 */
 
+const lightboxView = { scale: 1, fit: true, returnFocus: null };
+
+function lightboxFitScale() {
+  const stage = $('#lightboxStage');
+  const img = $('#lightboxImg');
+  const style = getComputedStyle(stage);
+  const width = stage.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const height = stage.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+  return Math.min(width / img.naturalWidth, height / img.naturalHeight, 1);
+}
+
+/** 用实际像素尺寸缩放，溢出内容留在可滚动区域内，工具条始终可见。 */
+function setLightboxScale(scale, fit = false) {
+  const box = $('#lightbox');
+  const stage = $('#lightboxStage');
+  const img = $('#lightboxImg');
+  if (box.hidden || !img.naturalWidth || !img.naturalHeight) return;
+  const fitScale = lightboxFitScale();
+  if (!(fitScale > 0)) return;
+  const minScale = Math.min(fitScale, 0.1);
+  const next = fit ? fitScale : Math.max(minScale, Math.min(4, scale));
+  const old = img.getBoundingClientRect();
+  const viewport = stage.getBoundingClientRect();
+  const centerX = (viewport.left + stage.clientWidth / 2 - old.left) / (old.width || 1);
+  const centerY = (viewport.top + stage.clientHeight / 2 - old.top) / (old.height || 1);
+  lightboxView.scale = next;
+  lightboxView.fit = fit;
+  img.style.width = img.naturalWidth * next + 'px';
+  img.style.height = img.naturalHeight * next + 'px';
+  img.style.visibility = '';
+  if (fit) {
+    stage.scrollLeft = 0;
+    stage.scrollTop = 0;
+  } else {
+    const rect = img.getBoundingClientRect();
+    stage.scrollLeft += rect.left + rect.width * centerX - viewport.left - stage.clientWidth / 2;
+    stage.scrollTop += rect.top + rect.height * centerY - viewport.top - stage.clientHeight / 2;
+  }
+  setText($('#lightboxScale'), (next < 0.1 ? (next * 100).toFixed(1) : Math.round(next * 100)) + '%');
+  $('#btnZoomOut').disabled = next <= minScale;
+  $('#btnZoomIn').disabled = next >= 4;
+}
+
 /**
  * 打开大图灯箱。
  *
@@ -1398,9 +1487,21 @@ function openLightbox(m, src) {
     dl.href = m.fileUrl || ('/api/chat-files/' + m.fileId);
     dl.setAttribute('download', m.fileName || '');
   }
-  img.src = src;
+  if (box.hidden) lightboxView.returnFocus = document.activeElement;
+  lightboxView.fit = true;
+  img.style.visibility = 'hidden';
+  img.style.width = '';
+  img.style.height = '';
+  img.onload = () => setLightboxScale(1, true);
+  img.onerror = () => {
+    closeLightbox();
+    toast('图片加载失败，请尝试下载原图', 'err');
+  };
   img.alt = m.fileName || '图片';
   box.hidden = false;
+  img.src = src;
+  if (img.complete && img.naturalWidth) setLightboxScale(1, true);
+  $('#btnCloseLightbox').focus();
 }
 
 function closeLightbox() {
@@ -1409,7 +1510,13 @@ function closeLightbox() {
   if (!box || box.hidden) return;
   box.hidden = true;
   // 清空 src 再关，避免大图继续占着内存（尤其是一次翻过十几张之后）。
-  if (img) img.removeAttribute('src');
+  if (img) {
+    img.onload = null;
+    img.onerror = null;
+    img.removeAttribute('src');
+  }
+  if (lightboxView.returnFocus && lightboxView.returnFocus.isConnected) lightboxView.returnFocus.focus();
+  lightboxView.returnFocus = null;
 }
 
 /**
@@ -2318,6 +2425,7 @@ function bindEvents() {
   // ---- 房间 ----
   $('#btnCreate').addEventListener('click', openCreate);
   $('#btnJoin').addEventListener('click', joinSession);
+  $('#btnCreateMissing').addEventListener('click', createMissingSession);
   $('#btnLeave').addEventListener('click', () => leaveRoom(false));
 
   // ---- 创建房间弹窗 ----
@@ -2343,6 +2451,7 @@ function bindEvents() {
   // 房间号输入：自动大写、Enter 直接加入。
   const joinCode = $('#joinCode');
   joinCode.addEventListener('input', () => {
+    resetJoinFeedback();
     const pos = joinCode.selectionStart;
     joinCode.value = joinCode.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
     joinCode.setSelectionRange(pos, pos);
@@ -2499,11 +2608,21 @@ function bindEvents() {
   // 点背景（而不是点在图上或工具条上）才关，否则想选个图都会被关掉。
   const lb = $('#lightbox');
   if (lb) {
-    lb.addEventListener('mousedown', (e) => {
-      if (e.target === lb || e.target.id === 'lightboxStage') closeLightbox();
+    lb.addEventListener('click', (e) => {
+      const stage = $('#lightboxStage');
+      const rect = stage.getBoundingClientRect();
+      const onBackground = e.target === stage
+        && e.clientX < rect.left + stage.clientWidth
+        && e.clientY < rect.top + stage.clientHeight;
+      if (e.target === lb || onBackground) closeLightbox();
     });
     const closeBtn = $('#btnCloseLightbox');
     if (closeBtn) closeBtn.addEventListener('click', closeLightbox);
+    $('#btnZoomOut').addEventListener('click', () => setLightboxScale(lightboxView.scale / 1.25));
+    $('#btnZoomIn').addEventListener('click', () => setLightboxScale(lightboxView.scale * 1.25));
+    $('#btnZoomFit').addEventListener('click', () => setLightboxScale(1, true));
+    $('#btnZoomActual').addEventListener('click', () => setLightboxScale(1));
+    window.addEventListener('resize', () => setLightboxScale(lightboxView.scale, lightboxView.fit));
   }
 
   // ---- 快捷键 ----

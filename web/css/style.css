@@ -825,6 +825,7 @@ button, input, textarea { font: inherit; color: inherit; }
   z-index: 150;            /* 高于普通弹窗(100)，低于 toast(200) */
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   /* 固定深色而不跟随主题：看图时四周越暗越好，
      浅色主题下用半透明白底会让图片发灰。 */
   background: rgba(10, 12, 16, .93);
@@ -833,25 +834,29 @@ button, input, textarea { font: inherit; color: inherit; }
   animation: fade-in .14s ease-out;
 }
 .lightbox-stage {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0;
-  display: grid;
-  place-items: center;
+  min-width: 0;
+  display: flex;
+  overflow: auto;
   padding: 22px;
 }
 .lightbox-stage img {
-  max-width: 100%;
-  max-height: 100%;
+  flex: 0 0 auto;
+  display: block;
+  margin: auto;
+  max-width: none;
+  max-height: none;
   width: auto;
   height: auto;
   object-fit: contain;
   border-radius: var(--radius-xs);
   box-shadow: 0 18px 60px rgba(0, 0, 0, .5);
-  animation: pop-in .18s cubic-bezier(.2, .9, .3, 1.1);
 }
 .lightbox-bar {
   flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   padding: 11px 16px;
@@ -870,6 +875,14 @@ button, input, textarea { font: inherit; color: inherit; }
   white-space: nowrap;
 }
 .lightbox-meta { color: #98a0b2; font-variant-numeric: tabular-nums; }
+.lightbox-zoom { display: flex; align-items: center; gap: 6px; }
+.lightbox-zoom output { min-width: 48px; text-align: center; font-variant-numeric: tabular-nums; }
+@media (max-width: 600px) {
+  .lightbox-stage { padding: 12px; }
+  .lightbox-name { flex: 1 1 100%; max-width: 100%; }
+  .lightbox-bar .grow { display: none; }
+  .lightbox-zoom { flex-wrap: wrap; }
+}
 /* 工具条里的占位撑开用全局的 .grow（见 722 行），此处不再重复定义。 */
 
 /* 灯箱里的按钮：幽灵按钮的默认色是跟随主题的深色文字，
