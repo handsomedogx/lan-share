@@ -183,8 +183,13 @@ function extOf(name) {
 const state = {
   user: null,            // 当前登录用户，null 表示未登录
   files: [],             // 文件列表缓存（仓库只有永久文件，没有分类）
+  folders: [],           // 文件夹列表缓存
+  filesTotalSize: 0,     // 服务端给的总占用字节数
   filesTotalText: '',    // 服务端给的总体积文案，未搜索时直接用它
   fileQuery: '',         // 文件仓库的搜索词（纯前端过滤，见 visibleFiles）
+  currentFolderId: null, // 当前所在文件夹 ID，null 表示根目录
+  fileView: 'list',      // 文件仓库视图：'list' | 'card'
+  theme: 'auto',         // 界面主题：'auto' | 'light' | 'dark'
 
   authMode: 'login',     // login | register
   status: null,          // /api/status 最近一次结果
@@ -210,6 +215,36 @@ const state = {
 };
 
 const LS_CODE = 'lanshare.code';
+const LS_FILE_VIEW = 'lanshare.fileView';
+const LS_THEME = 'lanshare.theme';
+
+function syncThemeButtons() {
+  $$('#themeSwitch [data-theme-opt]').forEach((btn) => {
+    const active = btn.dataset.themeOpt === state.theme;
+    btn.classList.toggle('is-active', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+}
+
+function applyTheme(mode, persist = true) {
+  const next = (mode === 'light' || mode === 'dark') ? mode : 'auto';
+  state.theme = next;
+  const root = document.documentElement;
+  if (root) {
+    if (next === 'auto') {
+      root.removeAttribute('data-theme');
+    } else {
+      root.setAttribute('data-theme', next);
+    }
+  }
+  if (persist) {
+    try {
+      if (next === 'auto') localStorage.removeItem(LS_THEME);
+      else localStorage.setItem(LS_THEME, next);
+    } catch (_) {}
+  }
+  syncThemeButtons();
+}
 
 /* ------------------------------------------------------------------ 3. 提示条 */
 
@@ -243,15 +278,7 @@ function setStatus(left, right) {
   if (right != null) setText($('#statusRight'), right);
 }
 
-/* ------------------------------------------------------------------ 4. 网络状态指示 */
-
-function setNet(kind, text) {
-  const dot = $('#netPill .dot');
-  if (dot) dot.className = 'dot dot-' + kind;
-  setText($('#netText'), text);
-}
-
-/* ------------------------------------------------------------------ 5. 登录态 */
+/* ------------------------------------------------------------------ 4. 登录态 */
 
 /** 渲染顶栏用户区域。 */
 function renderUser() {
@@ -458,6 +485,7 @@ function renderSetup() {
   // needSetup 会决定提示条显不显示，所以状态刷新后要重算一次。
   renderLock();
   renderUploadLimits();
+  renderUsage();
 }
 
 /** 格式化单文件大小限制文案：0 或负数表示不限。 */
@@ -900,7 +928,6 @@ function leaveRoom(silent) {
   const tag = $('#ttlTag');
   if (tag) tag.hidden = true;
   setText($('#brandSub'), '局域网内容传输');
-  setNet('idle', '未连接');
   setStatus('已退出房间', '');
 
   if (!silent) toast('已退出房间', 'info');
@@ -918,12 +945,10 @@ function connect() {
     return;
   }
   state.ws = ws;
-  setNet('warn', '连接中…');
 
   ws.addEventListener('open', () => {
     state.wsReady = true;
     state.reconnectDelay = 1000;
-    setNet('ok', '已连接');
     setStatus('会话 ' + state.room + ' · 已连接', '');
     syncSendButton();
   });
@@ -937,17 +962,12 @@ function connect() {
   ws.addEventListener('close', () => {
     state.wsReady = false;
     state.ws = null;
-    if (state.manualLeave || !state.room) {
-      setNet('idle', '未连接');
-      return;
-    }
-    setNet('bad', '已断开');
+    if (state.manualLeave || !state.room) return;
     scheduleReconnect();
   });
 
   ws.addEventListener('error', () => {
-    // 具体错误交给 close 处理，这里只更新指示。
-    if (state.room && !state.manualLeave) setNet('bad', '连接异常');
+    // 具体错误交给 close 处理。
   });
 }
 
@@ -1342,6 +1362,140 @@ function clearAttachments() {
  * 卡片本身就是一个 <a>，点哪儿都能下载 —— 文件消息里「下载」是唯一主操作，
  * 没必要再放一个需要精确点击的按钮。
  */
+const FOLDER_SVG = '<svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">'
+  + '<path d="M5 10.5A3.5 3.5 0 018.5 7h6.4a2.8 2.8 0 012.1.96L19.1 10H32a3 3 0 013 3v16.5a3.5 3.5 0 01-3.5 3.5h-23A3.5 3.5 0 015 29.5V10.5z" fill="#D97706" stroke="#B45309" stroke-width="1.2" stroke-linejoin="round"/>'
+  + '<rect x="9" y="11" width="22" height="10" rx="1.6" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="0.9"/>'
+  + '<path d="M12.5 14h11" stroke="#60A5FA" stroke-width="1.6" stroke-linecap="round"/>'
+  + '<rect x="7.5" y="13.2" width="25" height="9" rx="1.6" fill="#FEF3C7"/>'
+  + '<path d="M4.5 17.6A2.6 2.6 0 017.1 15h25.8a2.6 2.6 0 012.6 2.6l-.8 12.2a3.2 3.2 0 01-3.2 3H8.5a3.2 3.2 0 01-3.2-3l-.8-12.2z" fill="#FBBF24" stroke="#B45309" stroke-width="1.2" stroke-linejoin="round"/>'
+  + '<path d="M6.2 16.5h27.6" stroke="#FEF9C3" stroke-width="1.4" stroke-linecap="round"/>'
+  + '<path d="M5.6 26.8l.4 3A2.7 2.7 0 008.7 32.2h22.6a2.7 2.7 0 002.7-2.4l.4-3H5.6z" fill="#F59E0B" opacity=".55"/>'
+  + '</svg>';
+
+const UP_SVG = '<svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">'
+  + '<path d="M5.5 12A3.2 3.2 0 018.7 8.8h5.8a2.4 2.4 0 011.9.9L18.2 11.8H30a2.8 2.8 0 012.8 2.8V28a3.2 3.2 0 01-3.2 3.2H8.7A3.2 3.2 0 015.5 28V12z" fill="#93C5FD" stroke="#3B82F6" stroke-width="1.2" stroke-linejoin="round"/>'
+  + '<path d="M5 17.8A2.4 2.4 0 017.4 15.4h23.8a2.4 2.4 0 012.4 2.4l-.6 10.6a2.8 2.8 0 01-2.8 2.8H8.4a2.8 2.8 0 01-2.8-2.8L5 17.8z" fill="#DBEAFE" stroke="#3B82F6" stroke-width="1.2" stroke-linejoin="round"/>'
+  + '<circle cx="26.5" cy="24.5" r="8.5" fill="#4F46E5" stroke="#FFFFFF" stroke-width="1.6"/>'
+  + '<path d="M26.5 28.2v-7.4m0 0l-3.2 3.2m3.2-3.2l3.2 3.2" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'
+  + '</svg>';
+
+function docShellSVG(foldColor, strokeColor, body) {
+  return '<svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">'
+    + '<path d="M8 5.8A2.8 2.8 0 0110.8 3h13.7L32 10.5V34.2A2.8 2.8 0 0129.2 37H10.8A2.8 2.8 0 018 34.2V5.8z" fill="#FFFFFF" stroke="' + strokeColor + '" stroke-width="1.35" stroke-linejoin="round"/>'
+    + '<path d="M24.5 3v5.4a2.1 2.1 0 002.1 2.1H32L24.5 3z" fill="' + foldColor + '" stroke="' + strokeColor + '" stroke-width="1.15" stroke-linejoin="round"/>'
+    + body + '</svg>';
+}
+
+function fileIconSVG(name) {
+  const ext = extOf(name || '');
+  if (['png', 'jpg', 'jpeg', 'jfif', 'gif', 'webp', 'bmp', 'svg', 'avif', 'ico'].includes(ext)) {
+    return '<svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">'
+      + '<rect x="5" y="6.5" width="30" height="27" rx="4.2" fill="#FFFFFF" stroke="#8B5CF6" stroke-width="1.4"/>'
+      + '<rect x="7.5" y="9" width="25" height="22" rx="2.6" fill="#DBEAFE"/>'
+      + '<path d="M7.5 11.6A2.6 2.6 0 0110.1 9h19.8a2.6 2.6 0 012.6 2.6V19H7.5v-7.4z" fill="#C7D2FE"/>'
+      + '<circle cx="14.5" cy="14.6" r="2.9" fill="#FBBF24"/>'
+      + '<path d="M8.2 31l7.6-8.6a1.4 1.4 0 012.1 0l4.3 4.8 3.2-3.4a1.4 1.4 0 012 0l5.1 5.6V31H8.2z" fill="#10B981"/>'
+      + '<path d="M18.5 31l6.9-7.4a1.4 1.4 0 012 0l5.1 5.6V31h-14z" fill="#047857" opacity=".82"/>'
+      + '</svg>';
+  }
+  if (['txt', 'md', 'log'].includes(ext)) {
+    const tag = ext === 'md' ? 'MD' : (ext === 'log' ? 'LOG' : 'TXT');
+    return docShellSVG('#93C5FD', '#3B82F6',
+      '<rect x="11.5" y="8" width="11" height="4.8" rx="1.5" fill="#2563EB"/>'
+      + '<text x="17" y="11.6" text-anchor="middle" font-family="system-ui,sans-serif" font-size="3.9" font-weight="800" fill="#FFFFFF">' + tag + '</text>'
+      + '<path d="M12 17.5h15.5M12 22h16M12 26.5h12.5" stroke="#64748B" stroke-width="2" stroke-linecap="round"/>'
+      + '<path d="M12 31h8.5" stroke="#3B82F6" stroke-width="2" stroke-linecap="round"/>'
+      + '<path d="M26.5 29.8l4.2-4.2 1.8 1.8-4.2 4.2-2.4.6.6-2.4z" fill="#F59E0B" stroke="#D97706" stroke-width="0.7" stroke-linejoin="round"/>');
+  }
+  if (ext === 'pdf') {
+    return docShellSVG('#FCA5A5', '#DC2626',
+      '<rect x="10.5" y="13.5" width="19" height="8.2" rx="2.2" fill="#EF4444"/>'
+      + '<text x="20" y="19.3" text-anchor="middle" font-family="system-ui,sans-serif" font-size="5.6" font-weight="800" fill="#FFFFFF">PDF</text>'
+      + '<path d="M13 29.5c2.2-3.5 4.2-6 5.2-7.8.9 2.2 2.9 5 6.8 6.4-2.8.2-5.4-.1-8.2.8-1.5.5-2.8 1.2-3.8.6z" fill="none" stroke="#DC2626" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>');
+  }
+  if (['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz'].includes(ext)) {
+    return '<svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">'
+      + '<rect x="6" y="7" width="28" height="27" rx="4.2" fill="#FDE68A" stroke="#D97706" stroke-width="1.35"/>'
+      + '<path d="M6 12.2A5.2 5.2 0 0111.2 7h17.6A5.2 5.2 0 0134 12.2V14H6v-1.8z" fill="#F59E0B" stroke="#D97706" stroke-width="1.2"/>'
+      + '<rect x="17.5" y="7" width="5" height="27" fill="#78350F" opacity=".2"/>'
+      + '<path d="M18.2 10h2v2h-2zm2 3h2v2h-2zm-2 3h2v2h-2zm2 3h2v2h-2z" fill="#FFFBEB"/>'
+      + '<rect x="16.4" y="21.5" width="7.2" height="8.2" rx="2" fill="#EA580C" stroke="#9A3412" stroke-width="1"/>'
+      + '<circle cx="20" cy="26.2" r="1.4" fill="#FEF3C7"/>'
+      + '</svg>';
+  }
+  if (ext === 'apk') {
+    return docShellSVG('#6EE7B7', '#059669',
+      '<path d="M13.5 22.5a6.5 6.5 0 0113 0H13.5z" fill="#10B981"/>'
+      + '<path d="M16 16.5l-1.6-2.4M24 16.5l1.6-2.4" stroke="#059669" stroke-width="1.6" stroke-linecap="round"/>'
+      + '<circle cx="17.4" cy="19.6" r="1" fill="#FFFFFF"/><circle cx="22.6" cy="19.6" r="1" fill="#FFFFFF"/>'
+      + '<rect x="11.5" y="25.2" width="17" height="7" rx="2" fill="#059669"/>'
+      + '<text x="20" y="30.2" text-anchor="middle" font-family="system-ui,sans-serif" font-size="4.8" font-weight="800" fill="#FFFFFF">APK</text>');
+  }
+  if (['exe', 'msi', 'bat', 'cmd', 'dmg', 'deb', 'rpm'].includes(ext)) {
+    return '<svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">'
+      + '<rect x="5" y="6.5" width="30" height="27" rx="4" fill="#F8FAFC" stroke="#4F46E5" stroke-width="1.35"/>'
+      + '<path d="M5 10.5A4 4 0 019 6.5h22a4 4 0 014 4v3.8H5v-3.8z" fill="#312E81"/>'
+      + '<circle cx="9.2" cy="10.4" r="1.3" fill="#FB7185"/><circle cx="13.2" cy="10.4" r="1.3" fill="#FBBF24"/><circle cx="17.2" cy="10.4" r="1.3" fill="#34D399"/>'
+      + '<circle cx="20" cy="24" r="5.2" fill="none" stroke="#0EA5E9" stroke-width="2.6" stroke-dasharray="2.4 1.6"/>'
+      + '<circle cx="20" cy="24" r="2.4" fill="#4F46E5"/>'
+      + '</svg>';
+  }
+  if (['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'].includes(ext)) {
+    return '<svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">'
+      + '<rect x="5" y="6.5" width="30" height="27" rx="4.2" fill="#FDF2F8" stroke="#DB2777" stroke-width="1.35"/>'
+      + '<path d="M5 10.7A4.2 4.2 0 019.2 6.5h21.6a4.2 4.2 0 014.2 4.2v3.6H5v-3.6z" fill="#BE185D"/>'
+      + '<path d="M9.5 6.5l2.5 7.8M17.5 6.5l2.5 7.8M25.5 6.5l2.5 7.8" stroke="#FBCFE8" stroke-width="1.8"/>'
+      + '<circle cx="20" cy="23.8" r="6.8" fill="#EC4899"/>'
+      + '<path d="M18 20.6l5.8 3.2-5.8 3.2v-6.4z" fill="#FFFFFF"/>'
+      + '</svg>';
+  }
+  if (['mp3', 'wav', 'flac', 'm4a', 'ogg', 'aac'].includes(ext)) {
+    return '<svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">'
+      + '<rect x="5.5" y="5.5" width="29" height="29" rx="5" fill="#ECFEFF" stroke="#0D9488" stroke-width="1.35"/>'
+      + '<path d="M16.5 25.5V14.2l11-2.2v11.5" fill="none" stroke="#0F766E" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>'
+      + '<path d="M16.5 14.2l11-2.2v3l-11 2.2z" fill="#14B8A6"/>'
+      + '<circle cx="13.8" cy="26.2" r="3.1" fill="#06B6D4"/><circle cx="24.8" cy="24" r="3.1" fill="#0D9488"/>'
+      + '</svg>';
+  }
+  if (['doc', 'docx', 'rtf', 'odt'].includes(ext)) {
+    return docShellSVG('#93C5FD', '#2563EB',
+      '<rect x="11.5" y="13.5" width="9.5" height="9.5" rx="2" fill="#2563EB"/>'
+      + '<text x="16.2" y="20.4" text-anchor="middle" font-family="system-ui,sans-serif" font-size="6.4" font-weight="800" fill="#FFFFFF">W</text>'
+      + '<path d="M23.5 15.5h5M23.5 19.5h5M12 27h16.5M12 31.2h12" stroke="#3B82F6" stroke-width="1.9" stroke-linecap="round"/>');
+  }
+  if (['xls', 'xlsx', 'csv', 'ods'].includes(ext)) {
+    return docShellSVG('#86EFAC', '#16A34A',
+      '<rect x="11.5" y="14.5" width="17" height="16.5" rx="2" fill="#DCFCE7" stroke="#22C55E" stroke-width="1.1"/>'
+      + '<path d="M11.5 19.8h17M11.5 25.2h17M17.4 14.5V31" stroke="#22C55E" stroke-width="1.1"/>'
+      + '<rect x="11.5" y="14.5" width="17" height="5.3" rx="1.4" fill="#16A34A"/>'
+      + '<text x="20" y="18.4" text-anchor="middle" font-family="system-ui,sans-serif" font-size="4.1" font-weight="800" fill="#FFFFFF">' + (ext === 'csv' ? 'CSV' : 'XLS') + '</text>');
+  }
+  if (['ppt', 'pptx', 'key', 'odp'].includes(ext)) {
+    return docShellSVG('#FDBA74', '#EA580C',
+      '<rect x="11.5" y="14" width="17" height="12.5" rx="2" fill="#FFF7ED" stroke="#F97316" stroke-width="1.2"/>'
+      + '<circle cx="17.5" cy="20.2" r="3.8" fill="#F97316"/>'
+      + '<path d="M17.5 20.2V16.4a3.8 3.8 0 013.8 3.8h-3.8z" fill="#FACC15"/>'
+      + '<path d="M23 18.2h3.5M23 21.6h2.8M15 30.5h10" stroke="#EA580C" stroke-width="1.8" stroke-linecap="round"/>');
+  }
+  if (['go', 'js', 'ts', 'jsx', 'tsx', 'py', 'rs', 'java', 'c', 'cpp', 'h', 'hpp', 'json', 'html', 'css', 'scss', 'sh', 'ps1', 'yml', 'yaml', 'xml', 'sql', 'toml'].includes(ext)) {
+    return '<svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">'
+      + '<path d="M8 5.8A2.8 2.8 0 0110.8 3h13.7L32 10.5V34.2A2.8 2.8 0 0129.2 37H10.8A2.8 2.8 0 018 34.2V5.8z" fill="#1E293B" stroke="#475569" stroke-width="1.35" stroke-linejoin="round"/>'
+      + '<path d="M24.5 3v5.4a2.1 2.1 0 002.1 2.1H32L24.5 3z" fill="#475569" stroke="#64748B" stroke-width="1.1" stroke-linejoin="round"/>'
+      + '<circle cx="12.2" cy="8.2" r="1.1" fill="#F87171"/><circle cx="15.5" cy="8.2" r="1.1" fill="#FBBF24"/><circle cx="18.8" cy="8.2" r="1.1" fill="#34D399"/>'
+      + '<path d="M15.8 18.2l-3.6 3.5 3.6 3.5" fill="none" stroke="#38BDF8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'
+      + '<path d="M24.2 18.2l3.6 3.5-3.6 3.5" fill="none" stroke="#34D399" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'
+      + '<path d="M21.4 16.8l-2.8 9.8" stroke="#FBBF24" stroke-width="2" stroke-linecap="round"/>'
+      + '<path d="M12.5 30.2h11" stroke="#64748B" stroke-width="1.8" stroke-linecap="round"/>'
+      + '</svg>';
+  }
+  const label = escapeHTML((ext ? ext.slice(0, 4) : 'FILE').toUpperCase());
+  const fSize = label.length >= 4 ? '4.8' : '5.4';
+  return docShellSVG('#CBD5E1', '#64748B',
+    '<rect x="11" y="14" width="18" height="7.6" rx="2" fill="#6366F1"/>'
+    + '<text x="20" y="19.5" text-anchor="middle" font-family="system-ui,sans-serif" font-size="' + fSize + '" font-weight="800" fill="#FFFFFF">' + label + '</text>'
+    + '<path d="M12.5 26.2h15M12.5 30.4h10.5" stroke="#94A3B8" stroke-width="1.9" stroke-linecap="round"/>');
+}
+
 function buildFileCard(m) {
   const a = document.createElement('a');
   a.className = 'msg-file';
@@ -1351,8 +1505,7 @@ function buildFileCard(m) {
 
   const icon = document.createElement('span');
   icon.className = 'msg-file-icon';
-  const ext = extOf(m.fileName || '');
-  setText(icon, ext ? ext.slice(0, 4) : 'FILE');
+  icon.innerHTML = fileIconSVG(m.fileName || '');
 
   const meta = document.createElement('div');
   meta.className = 'msg-file-meta';
@@ -1464,47 +1617,90 @@ function buildImageCard(m) {
 
 /* --------------------------------------------------------------- 灯箱 */
 
-const lightboxView = { scale: 1, fit: true, returnFocus: null };
+const LIGHTBOX_MAX_SCALE = 8;
+
+const lightboxView = {
+  scale: 1,
+  fit: true,
+  tx: 0,
+  ty: 0,
+  dragging: false,
+  pointerId: null,
+  startX: 0,
+  startY: 0,
+  startTx: 0,
+  startTy: 0,
+  moved: false,
+  suppressClick: false,
+  returnFocus: null
+};
 
 function lightboxFitScale() {
   const stage = $('#lightboxStage');
   const img = $('#lightboxImg');
+  if (!stage || !img || !img.naturalWidth || !img.naturalHeight) return 1;
   const style = getComputedStyle(stage);
   const width = stage.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
   const height = stage.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
   return Math.min(width / img.naturalWidth, height / img.naturalHeight, 1);
 }
 
-/** 用实际像素尺寸缩放，溢出内容留在可滚动区域内，工具条始终可见。 */
-function setLightboxScale(scale, fit = false) {
+function clampLightboxOffset() {
+  const stage = $('#lightboxStage');
+  const img = $('#lightboxImg');
+  if (!stage || !img || !img.naturalWidth || !img.naturalHeight) return;
+  const imgW = img.naturalWidth * lightboxView.scale;
+  const imgH = img.naturalHeight * lightboxView.scale;
+  const marginX = Math.min(80, imgW * 0.5, stage.clientWidth * 0.25);
+  const marginY = Math.min(80, imgH * 0.5, stage.clientHeight * 0.25);
+  const maxX = Math.max(0, (stage.clientWidth + imgW) / 2 - marginX);
+  const maxY = Math.max(0, (stage.clientHeight + imgH) / 2 - marginY);
+  lightboxView.tx = Math.max(-maxX, Math.min(maxX, lightboxView.tx));
+  lightboxView.ty = Math.max(-maxY, Math.min(maxY, lightboxView.ty));
+}
+
+function applyLightboxTransform() {
+  const img = $('#lightboxImg');
+  if (!img) return;
+  img.style.transform = 'translate3d(' + lightboxView.tx + 'px, ' + lightboxView.ty + 'px, 0) translate(-50%, -50%)';
+}
+
+/** 用实际像素尺寸缩放，支持围绕光标定点缩放及左键拖拽平移。 */
+function setLightboxScale(scale, fit = false, anchor = null) {
   const box = $('#lightbox');
   const stage = $('#lightboxStage');
   const img = $('#lightboxImg');
-  if (box.hidden || !img.naturalWidth || !img.naturalHeight) return;
+  if (!box || box.hidden || !stage || !img || !img.naturalWidth || !img.naturalHeight) return;
   const fitScale = lightboxFitScale();
   if (!(fitScale > 0)) return;
   const minScale = Math.min(fitScale, 0.1);
-  const next = fit ? fitScale : Math.max(minScale, Math.min(4, scale));
-  const old = img.getBoundingClientRect();
-  const viewport = stage.getBoundingClientRect();
-  const centerX = (viewport.left + stage.clientWidth / 2 - old.left) / (old.width || 1);
-  const centerY = (viewport.top + stage.clientHeight / 2 - old.top) / (old.height || 1);
+  const prev = lightboxView.scale || 1;
+  const next = fit ? fitScale : Math.max(minScale, Math.min(LIGHTBOX_MAX_SCALE, scale));
+
+  if (fit || (anchor && anchor.reset)) {
+    lightboxView.tx = 0;
+    lightboxView.ty = 0;
+  } else {
+    const viewport = stage.getBoundingClientRect();
+    const cx = viewport.left + stage.clientWidth / 2;
+    const cy = viewport.top + stage.clientHeight / 2;
+    const px = anchor && anchor.x != null ? anchor.x : cx;
+    const py = anchor && anchor.y != null ? anchor.y : cy;
+    const ratio = next / prev;
+    lightboxView.tx = (px - cx) - (px - cx - lightboxView.tx) * ratio;
+    lightboxView.ty = (py - cy) - (py - cy - lightboxView.ty) * ratio;
+  }
+
   lightboxView.scale = next;
   lightboxView.fit = fit;
   img.style.width = img.naturalWidth * next + 'px';
   img.style.height = img.naturalHeight * next + 'px';
   img.style.visibility = '';
-  if (fit) {
-    stage.scrollLeft = 0;
-    stage.scrollTop = 0;
-  } else {
-    const rect = img.getBoundingClientRect();
-    stage.scrollLeft += rect.left + rect.width * centerX - viewport.left - stage.clientWidth / 2;
-    stage.scrollTop += rect.top + rect.height * centerY - viewport.top - stage.clientHeight / 2;
-  }
+  clampLightboxOffset();
+  applyLightboxTransform();
   setText($('#lightboxScale'), (next < 0.1 ? (next * 100).toFixed(1) : Math.round(next * 100)) + '%');
-  $('#btnZoomOut').disabled = next <= minScale;
-  $('#btnZoomIn').disabled = next >= 4;
+  $('#btnZoomOut').disabled = next <= minScale + 1e-4;
+  $('#btnZoomIn').disabled = next >= LIGHTBOX_MAX_SCALE - 1e-4;
 }
 
 /**
@@ -1515,6 +1711,7 @@ function setLightboxScale(scale, fit = false) {
  */
 function openLightbox(m, src) {
   const box = $('#lightbox');
+  const stage = $('#lightboxStage');
   const img = $('#lightboxImg');
   if (!box || !img) return;
 
@@ -1528,9 +1725,18 @@ function openLightbox(m, src) {
   }
   if (box.hidden) lightboxView.returnFocus = document.activeElement;
   lightboxView.fit = true;
+  lightboxView.scale = 1;
+  lightboxView.tx = 0;
+  lightboxView.ty = 0;
+  lightboxView.dragging = false;
+  lightboxView.pointerId = null;
+  lightboxView.moved = false;
+  lightboxView.suppressClick = false;
+  if (stage) stage.classList.remove('is-dragging');
   img.style.visibility = 'hidden';
   img.style.width = '';
   img.style.height = '';
+  img.style.transform = '';
   img.onload = () => setLightboxScale(1, true);
   img.onerror = () => {
     closeLightbox();
@@ -1545,13 +1751,22 @@ function openLightbox(m, src) {
 
 function closeLightbox() {
   const box = $('#lightbox');
+  const stage = $('#lightboxStage');
   const img = $('#lightboxImg');
   if (!box || box.hidden) return;
   box.hidden = true;
+  lightboxView.dragging = false;
+  lightboxView.pointerId = null;
+  lightboxView.moved = false;
+  lightboxView.suppressClick = false;
+  lightboxView.tx = 0;
+  lightboxView.ty = 0;
+  if (stage) stage.classList.remove('is-dragging');
   // 清空 src 再关，避免大图继续占着内存（尤其是一次翻过十几张之后）。
   if (img) {
     img.onload = null;
     img.onerror = null;
+    img.style.transform = '';
     img.removeAttribute('src');
   }
   if (lightboxView.returnFocus && lightboxView.returnFocus.isConnected) lightboxView.returnFocus.focus();
@@ -1728,9 +1943,11 @@ function renderLock() {
   if (overlay) overlay.hidden = !need;
   const btn = $('#btnUpload');
   if (btn) btn.disabled = !state.user;
+  const newFolderBtn = $('#btnNewFolder');
+  if (newFolderBtn) newFolderBtn.disabled = !state.user;
 }
 
-/** 拉取文件列表。 */
+/** 拉取文件与文件夹列表。 */
 async function loadFiles() {
   renderLock();
 
@@ -1741,13 +1958,20 @@ async function loadFiles() {
       // 列表已对所有人开放，401 理论上不会出现；真出现了就当空列表处理，
       // 别把「未登录」渲染成错误提示。
       state.files = [];
+      state.folders = [];
+      state.filesTotalSize = 0;
       state.filesTotalText = '';
       renderFiles();
       toast(data.error || '读取文件列表失败', 'err');
       return;
     }
     state.files = data.files || [];
+    state.folders = data.folders || [];
+    state.filesTotalSize = Number(data.totalSize) || 0;
     state.filesTotalText = data.totalText || '';
+    if (state.currentFolderId && !folderById(state.currentFolderId)) {
+      state.currentFolderId = null;
+    }
     // 搜索词不清：刷新、上传完成、置顶后都会走到这里，
     // 每次都把用户刚敲的词抹掉会很难用。过滤在 renderFiles 里重新应用。
     renderFiles();
@@ -1846,84 +2070,568 @@ function clearSearch() {
 /**
  * 空态文案。
  *
- * 「仓库是空的」和「搜索没命中」是两件事：后者必须给出出口，
- * 否则用户会以为文件没了 —— 尤其在他刚上传完、只是词打错了的时候。
+ * 「仓库是空的」「当前文件夹是空的」和「搜索没命中」是三件事，分别给出明确指引。
  */
-function renderFilesEmpty(total, shown, searching) {
+function renderFilesEmpty(allCount, shownCount, searching, hasUpRow) {
   const box = $('#fileEmpty');
   if (!box) return;
-  box.hidden = shown > 0;
-  if (shown > 0) return;
+  box.hidden = shownCount > 0 || !!hasUpRow;
+  if (!box.hidden) return;
 
-  if (searching && total > 0) {
-    setText($('#fileEmptyTitle'), '没有匹配的文件');
+  if (searching && allCount > 0) {
+    setText($('#fileEmptyTitle'), '没有匹配的文件或文件夹');
     setText($('#fileEmptyHint'),
-      total + ' 个文件里没有名字含「' + trim(state.fileQuery) + '」的，换个关键词或清空搜索');
+      '全部条目里没有名称含「' + trim(state.fileQuery) + '」的，换个关键词或清空搜索');
+  } else if (state.currentFolderId) {
+    setText($('#fileEmptyTitle'), '这个文件夹还是空的');
+    setText($('#fileEmptyHint'), '可以上传文件到这里，或返回上级目录拖入文件');
   } else {
-    // total 为 0 时即使正在搜索也说「仓库是空的」—— 那时「换个关键词」
-    // 是个假建议，仓库里本来就没有任何东西可搜。
     setText($('#fileEmptyTitle'), '文件仓库还是空的');
-    setText($('#fileEmptyHint'), '上传过的文件会长期保存在路由器数据分区');
+    setText($('#fileEmptyHint'), '上传过的文件会长期保存在文件仓库');
   }
 }
 
-/** 用量条文案。搜索时按命中结果统计，并显式写出「命中 / 总数」。 */
+/** 用量条文案与容量进度条。搜索时按命中结果统计，并显式写出「命中 / 总数」。 */
 function renderUsage(total, list, searching) {
-  const sum = list.reduce((n, f) => n + (Number(f.size) || 0), 0);
-  setText($('#usageText'), searching
-    // 命中时体积只能自己加 —— 服务端给的是全量总和
-    ? list.length + ' / ' + total + ' 个文件 · 共 ' + humanSize(sum)
-    // 未搜索时直接用服务端的文案，本地不再算一遍（少一处可能对不上的口径）
-    : total + ' 个文件 · 共 ' + (state.filesTotalText || humanSize(sum)));
-  setText($('#usageHint'), state.user ? '长期保存在路由器数据分区' : '浏览与下载无需登录');
+  const all = state.files || [];
+  const totalCount = total != null ? total : all.length;
+  const hasArgs = list != null;
+  const tokens = hasArgs ? [] : searchTokens();
+  const isSearch = hasArgs ? !!searching : tokens.length > 0;
+  const shown = hasArgs ? list : (isSearch ? all.filter((f) => nameMatches(f.name, tokens)) : all);
+
+  const shownSum = shown.reduce((n, f) => n + (Number(f.size) || 0), 0);
+  const totalSum = state.filesTotalSize || all.reduce((n, f) => n + (Number(f.size) || 0), 0);
+  const maxStorage = state.status && Number(state.status.maxStorage) ? Number(state.status.maxStorage) : 0;
+
+  if (isSearch) {
+    setText($('#usageText'), shown.length + ' / ' + totalCount + ' 个文件 · 共 ' + humanSize(shownSum));
+  } else if (maxStorage > 0) {
+    const pct = Math.min(100, Math.round((totalSum / maxStorage) * 100));
+    setText($('#usageText'),
+      totalCount + ' 个文件 · 已用 ' + (state.filesTotalText || humanSize(totalSum))
+      + ' / ' + humanSize(maxStorage) + ' (' + pct + '%)');
+  } else {
+    setText($('#usageText'), totalCount + ' 个文件 · 共 ' + (state.filesTotalText || humanSize(totalSum)));
+  }
+
+  const track = $('#usageTrack');
+  const fill = $('#usageFill');
+  if (track && fill) {
+    if (maxStorage > 0 && !isSearch) {
+      const ratio = Math.min(100, (totalSum / maxStorage) * 100);
+      track.hidden = false;
+      fill.style.width = (totalSum > 0 ? Math.max(2, ratio) : 0) + '%';
+      fill.classList.toggle('is-warn', ratio >= 80 && ratio < 95);
+      fill.classList.toggle('is-danger', ratio >= 95);
+    } else {
+      track.hidden = true;
+    }
+  }
+
+  setText($('#usageHint'), state.user ? '文件长期保存在本机仓库' : '浏览与下载无需登录');
 }
 
+/* ------------------------------------------------- 视图、文件夹、拖拽与预览 */
+
+const PIN_SVG = '<svg viewBox="0 0 20 20" width="16" height="16">'
+  + '<path d="M12.6 3.2a1 1 0 011.5.1l2.6 2.6a1 1 0 01-.1 1.5l-1.9 1.5-.4 3.1a.8.8 0 01-1.3.6L10 9.9l-3.4 3.4a.6.6 0 01-.9-.9L9.1 9 6.4 6.3a.8.8 0 01.6-1.3l3.1-.4 1.5-1.9z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>'
+  + '<path d="M5.6 14.4l-1.9 1.9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+
+
+const DL_SVG = '<svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">'
+  + '<path d="M10 3.5v8.6M6.6 9l3.4 3.4L13.4 9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>'
+  + '<path d="M4 15.5h12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>';
+
+const EDIT_SVG = '<svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">'
+  + '<path d="M13.6 3.6a1.7 1.7 0 012.4 2.4L7.2 14.8l-3.3.8.8-3.3 8.9-8.7z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>';
+
+const DEL_SVG = '<svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">'
+  + '<path d="M4.5 6h11M8 6V4.6a1 1 0 011-1h2a1 1 0 011 1V6M6.5 6l.7 9.2a1.4 1.4 0 001.4 1.3h2.8a1.4 1.4 0 001.4-1.3L13.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+function isRepoImage(f) {
+  if (!f) return false;
+  if (f.isImage === true) return true;
+  if (f.isImage === false) return false;
+  return IMAGE_EXTS.indexOf(extOf(f.name)) >= 0;
+}
+
+function isRepoText(f) {
+  if (!f) return false;
+  if (f.isText === true) return true;
+  if (f.isText === false) return false;
+  return extOf(f.name) === 'txt';
+}
+
+function isRepoPreviewable(f) {
+  return isRepoImage(f) || isRepoText(f);
+}
+
+function openRepoPreview(f) {
+  if (isRepoImage(f)) {
+    openLightbox({
+      fileName: f.name,
+      fileText: f.sizeText || humanSize(f.size),
+      fileSize: f.size,
+      fileUrl: f.downloadUrl
+    }, f.downloadUrl + '?inline=1');
+    return;
+  }
+  if (isRepoText(f)) {
+    openTextPreview(f);
+  }
+}
+
+function folderById(id) {
+  if (!id) return null;
+  return (state.folders || []).find((x) => x.id === id) || null;
+}
+
+function folderPath(id) {
+  const chain = [];
+  const seen = new Set();
+  let cur = folderById(id);
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    chain.unshift(cur);
+    cur = cur.parentId ? folderById(cur.parentId) : null;
+  }
+  return chain;
+}
+
+function folderPathText(id) {
+  if (!id) return '根目录';
+  const chain = folderPath(id);
+  return chain.length ? chain.map((c) => c.name).join(' / ') : '根目录';
+}
+
+function isDescendantFolder(candidateId, ancestorId) {
+  if (!candidateId || !ancestorId) return false;
+  const seen = new Set();
+  let cur = folderById(candidateId);
+  while (cur && !seen.has(cur.id)) {
+    if (cur.id === ancestorId) return true;
+    seen.add(cur.id);
+    cur = cur.parentId ? folderById(cur.parentId) : null;
+  }
+  return false;
+}
+
+function folderChildCount(folderId) {
+  const subFolders = (state.folders || []).filter((x) => (x.parentId || null) === folderId).length;
+  const subFiles = (state.files || []).filter((f) => (f.folderId || null) === folderId).length;
+  return subFolders + subFiles;
+}
+
+function canDeleteFile(f) {
+  if (!state.user) return false;
+  if (state.user.isAdmin) return true;
+  return !!f.owner && f.owner === state.user.username;
+}
+
+function canEditFolder(folder) {
+  if (!state.user) return false;
+  if (state.user.isAdmin) return true;
+  return !!folder.owner && folder.owner === state.user.username;
+}
+
+function syncViewButtons() {
+  $$('#viewSwitch .view-btn').forEach((btn) => {
+    const on = btn.dataset.view === state.fileView;
+    btn.classList.toggle('is-active', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
+
+function setFileView(view) {
+  state.fileView = view === 'card' ? 'card' : 'list';
+  try { localStorage.setItem(LS_FILE_VIEW, state.fileView); } catch (_) {}
+  syncViewButtons();
+  renderFiles();
+}
+
+function enterFolder(id) {
+  state.currentFolderId = id || null;
+  renderFiles();
+}
+
+/** 渲染面包屑路径条，非当前目录节点支持直接拖放移动文件/文件夹。 */
+function renderFolderBar() {
+  const bar = $('#folderBar');
+  if (!bar) return;
+  bar.textContent = '';
+
+  const curId = state.currentFolderId;
+  if (!curId) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+
+  const chain = folderPath(curId);
+  const rootBtn = document.createElement('button');
+  rootBtn.type = 'button';
+  rootBtn.className = 'crumb';
+  setText(rootBtn, '全部文件');
+  rootBtn.addEventListener('click', () => enterFolder(null));
+  attachDropTarget(rootBtn, null);
+  bar.appendChild(rootBtn);
+
+  chain.forEach((folder, idx) => {
+    const sep = document.createElement('span');
+    sep.className = 'crumb-sep';
+    sep.textContent = '/';
+    bar.appendChild(sep);
+
+    const isLast = idx === chain.length - 1;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'crumb' + (isLast ? ' is-current' : '');
+    btn.title = folder.name;
+    setText(btn, folder.name);
+    if (isLast) {
+      btn.disabled = true;
+    } else {
+      btn.addEventListener('click', () => enterFolder(folder.id));
+      attachDropTarget(btn, folder.id);
+    }
+    bar.appendChild(btn);
+  });
+}
+
+/* ------------------------------------------------- 内部拖拽移动 */
+
+let draggingItem = null;
+
+function canDropIntoFolder(item, targetFolderId) {
+  if (!item) return false;
+  const target = targetFolderId || null;
+  if (item.type === 'file') {
+    const f = (state.files || []).find((x) => x.id === item.id);
+    return !!f && canDeleteFile(f) && (f.folderId || null) !== target;
+  }
+  if (item.type === 'folder') {
+    const folder = folderById(item.id);
+    if (!folder || !canEditFolder(folder)) return false;
+    if ((folder.parentId || null) === target) return false;
+    if (target === item.id || isDescendantFolder(target, item.id)) return false;
+    return true;
+  }
+  return false;
+}
+
+function attachDraggable(el, item) {
+  el.draggable = true;
+  el.addEventListener('dragstart', (e) => {
+    draggingItem = item;
+    el.classList.add('is-dragging');
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('application/x-lanshare-item', JSON.stringify(item)); } catch (_) {}
+      try { e.dataTransfer.setData('text/plain', item.name || ''); } catch (_) {}
+    }
+  });
+  el.addEventListener('dragend', () => {
+    draggingItem = null;
+    el.classList.remove('is-dragging');
+    $$('.is-drop-target').forEach((n) => n.classList.remove('is-drop-target'));
+  });
+}
+
+function attachDropTarget(el, targetFolderId) {
+  let depth = 0;
+
+  el.addEventListener('dragenter', (e) => {
+    if (!canDropIntoFolder(draggingItem, targetFolderId)) return;
+    e.preventDefault();
+    depth++;
+    el.classList.add('is-drop-target');
+  });
+
+  el.addEventListener('dragover', (e) => {
+    if (!canDropIntoFolder(draggingItem, targetFolderId)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+  });
+
+  el.addEventListener('dragleave', () => {
+    if (!draggingItem) { depth = 0; el.classList.remove('is-drop-target'); return; }
+    depth = Math.max(0, depth - 1);
+    if (depth === 0) el.classList.remove('is-drop-target');
+  });
+
+  el.addEventListener('drop', (e) => {
+    if (!draggingItem) return;
+    e.preventDefault();
+    e.stopPropagation();
+    depth = 0;
+    el.classList.remove('is-drop-target');
+    const item = draggingItem;
+    draggingItem = null;
+    if (!canDropIntoFolder(item, targetFolderId)) return;
+    moveItemToFolder(item, targetFolderId || null);
+  });
+}
+
+async function moveItemToFolder(item, targetFolderId) {
+  const url = item.type === 'folder' ? ('/api/folders/' + item.id) : ('/api/files/' + item.id);
+  const body = item.type === 'folder'
+    ? { parentId: targetFolderId || 0 }
+    : { folderId: targetFolderId || 0 };
+  const destLabel = targetFolderId ? ('「' + folderPathText(targetFolderId) + '」') : '根目录';
+
+  try {
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast(data.error || '移动失败', 'err');
+      return;
+    }
+    toast('已移动到 ' + destLabel, 'ok');
+    await loadFiles();
+  } catch (_) {
+    toast('网络错误，移动失败', 'err');
+  }
+}
+
+/* ------------------------------------------------- 共用操作按钮 */
+
+function buildDownloadLink(f) {
+  const dl = document.createElement('a');
+  dl.className = 'btn btn-icon';
+  dl.href = f.downloadUrl;
+  dl.title = '下载';
+  dl.setAttribute('aria-label', '下载 ' + f.name);
+  dl.download = f.name;
+  dl.innerHTML = DL_SVG;
+  dl.addEventListener('click', (e) => e.stopPropagation());
+  dl.addEventListener('dblclick', (e) => e.stopPropagation());
+  return dl;
+}
+
+function buildRenameBtn(title, onClick) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn btn-icon';
+  btn.title = title;
+  btn.setAttribute('aria-label', title);
+  btn.innerHTML = EDIT_SVG;
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    onClick();
+  });
+  btn.addEventListener('dblclick', (e) => e.stopPropagation());
+  return btn;
+}
+
+function buildPinBtn(f, container) {
+  const pin = document.createElement('button');
+  pin.type = 'button';
+  pin.className = 'btn btn-icon' + (f.pinned ? ' is-active' : '');
+  pin.title = f.pinned ? '取消置顶' : '置顶';
+  pin.setAttribute('aria-label', pin.title + ' ' + f.name);
+  pin.innerHTML = PIN_SVG;
+  pin.addEventListener('click', (e) => {
+    e.stopPropagation();
+    togglePin(f, container);
+  });
+  pin.addEventListener('dblclick', (e) => e.stopPropagation());
+  return pin;
+}
+
+function buildDeleteBtn(label, onClick) {
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'btn btn-icon is-danger';
+  del.title = '删除';
+  del.setAttribute('aria-label', '删除 ' + label);
+  del.innerHTML = DEL_SVG;
+  del.addEventListener('click', (e) => {
+    e.stopPropagation();
+    onClick();
+  });
+  del.addEventListener('dblclick', (e) => e.stopPropagation());
+  return del;
+}
+
+/* ------------------------------------------------- 渲染列表视图与卡片视图 */
+
 function renderFiles() {
+  const allFiles = state.files || [];
+  const allFolders = state.folders || [];
+  const tokens = searchTokens();
+  const searching = tokens.length > 0;
+  const curId = state.currentFolderId;
+
+  const folders = searching
+    ? allFolders.filter((fd) => nameMatches(fd.name, tokens))
+    : allFolders.filter((fd) => (fd.parentId || null) === curId);
+
+  const files = searching
+    ? allFiles.filter((f) => nameMatches(f.name, tokens))
+    : allFiles.filter((f) => (f.folderId || null) === curId);
+
+  const curFolder = curId ? folderById(curId) : null;
+  const hasUpRow = !searching && !!curFolder;
+
+  renderFolderBar();
+  renderFilesEmpty(allFiles.length + allFolders.length, folders.length + files.length, searching, hasUpRow);
+  renderUsage(allFiles.length, files, searching);
+
+  const tableWrap = $('#fileTableWrap');
+  const grid = $('#fileGrid');
+  const isCard = state.fileView === 'card';
+  if (tableWrap) tableWrap.hidden = isCard;
+  if (grid) grid.hidden = !isCard;
+
+  if (isCard) {
+    renderFilesGrid(folders, files, tokens, searching, curFolder);
+  } else {
+    renderFilesTable(folders, files, tokens, searching, curFolder);
+  }
+}
+
+function renderFilesTable(folders, files, tokens, searching, curFolder) {
   const body = $('#fileBody');
   if (!body) return;
-
   body.innerHTML = '';
-  const all = state.files || [];
-  const tokens = searchTokens();
-  const list = tokens.length ? all.filter((f) => nameMatches(f.name, tokens)) : all;
 
-  renderFilesEmpty(all.length, list.length, tokens.length > 0);
-  renderUsage(all.length, list, tokens.length > 0);
-
-  list.forEach((f) => {
+  if (!searching && curFolder) {
+    const parentId = curFolder.parentId || null;
     const tr = document.createElement('tr');
-    tr.dataset.id = f.id;
-    // 置顶行加标记类，由 CSS 给出背景与左侧色条。
-    if (f.pinned) tr.classList.add('is-pinned');
+    tr.className = 'up-row';
 
-    // 文件名 + 类型图标
+    const tdName = document.createElement('td');
+    const wrap = document.createElement('div');
+    wrap.className = 'cell-name';
+    const icon = document.createElement('span');
+    icon.className = 'ftype ftype-up';
+    icon.innerHTML = UP_SVG;
+    const nm = document.createElement('div');
+    nm.className = 'fname';
+    setText(nm, '.. 返回上一级');
+    wrap.append(icon, nm);
+    tdName.appendChild(wrap);
+    tdName.addEventListener('click', () => enterFolder(parentId));
+
+    const tdSize = document.createElement('td');
+    tdSize.className = 'cell-size';
+    setText(tdSize, '上级目录');
+
+    const tdTime = document.createElement('td');
+    tdTime.className = 'cell-time';
+    setText(tdTime, '—');
+
+    const tdOwner = document.createElement('td');
+    tdOwner.className = 'cell-owner';
+    setText(tdOwner, '—');
+
+    const tdAct = document.createElement('td');
+    tdAct.className = 'cell-act';
+
+    tr.append(tdName, tdSize, tdTime, tdOwner, tdAct);
+    attachDropTarget(tr, parentId);
+    body.appendChild(tr);
+  }
+
+  folders.forEach((folder) => {
+    const tr = document.createElement('tr');
+    tr.className = 'folder-row';
+    tr.dataset.folderId = folder.id;
+
     const tdName = document.createElement('td');
     const wrap = document.createElement('div');
     wrap.className = 'cell-name';
 
-    const ext = extOf(f.name);
     const icon = document.createElement('span');
-    icon.className = 'ftype';
-    icon.dataset.t = ext;
-    setText(icon, ext ? ext.slice(0, 4) : 'FILE');
+    icon.className = 'ftype ftype-folder';
+    icon.innerHTML = FOLDER_SVG;
 
     const textWrap = document.createElement('div');
     textWrap.style.minWidth = '0';
     const nm = document.createElement('div');
     nm.className = 'fname';
-    nm.title = f.name;
-    // 搜索态下把命中的片段标出来，让用户一眼看出「为什么这条在这儿」。
+    nm.title = folder.name;
+    const hl = highlightedName(folder.name, tokens);
+    if (hl) nm.appendChild(hl); else setText(nm, folder.name);
+    textWrap.appendChild(nm);
+
+    if (searching && folder.parentId) {
+      const tag = document.createElement('span');
+      tag.className = 'fpath-tag';
+      tag.title = folderPathText(folder.parentId);
+      setText(tag, folderPathText(folder.parentId));
+      textWrap.appendChild(tag);
+    }
+
+    wrap.append(icon, textWrap);
+    tdName.appendChild(wrap);
+    tdName.addEventListener('click', () => enterFolder(folder.id));
+
+    const tdSize = document.createElement('td');
+    tdSize.className = 'cell-size';
+    const cnt = folderChildCount(folder.id);
+    setText(tdSize, cnt > 0 ? cnt + ' 项' : '空');
+
+    const tdTime = document.createElement('td');
+    tdTime.className = 'cell-time';
+    setText(tdTime, fmtTime(folder.createdAt));
+
+    const tdOwner = document.createElement('td');
+    tdOwner.className = 'cell-owner';
+    setText(tdOwner, folder.owner || '—');
+
+    const tdAct = document.createElement('td');
+    tdAct.className = 'cell-act';
+    if (canEditFolder(folder)) {
+      tdAct.appendChild(buildRenameBtn('重命名文件夹', () => openFolderModal('rename', folder)));
+      tdAct.appendChild(buildDeleteBtn(folder.name, () => deleteFolder(folder, tr)));
+      attachDraggable(tr, { type: 'folder', id: folder.id, name: folder.name });
+    }
+
+    tr.append(tdName, tdSize, tdTime, tdOwner, tdAct);
+    attachDropTarget(tr, folder.id);
+    body.appendChild(tr);
+  });
+
+  files.forEach((f) => {
+    const tr = document.createElement('tr');
+    tr.dataset.id = f.id;
+    if (f.pinned) tr.classList.add('is-pinned');
+
+    const tdName = document.createElement('td');
+    const wrap = document.createElement('div');
+    wrap.className = 'cell-name';
+
+    const previewable = isRepoPreviewable(f);
+    const icon = document.createElement('span');
+    icon.className = 'ftype' + (previewable ? ' is-previewable' : '');
+    icon.innerHTML = fileIconSVG(f.name);
+
+    const textWrap = document.createElement('div');
+    textWrap.style.minWidth = '0';
+    const nm = document.createElement('div');
+    nm.className = 'fname' + (previewable ? ' is-previewable' : '');
+    nm.title = previewable ? (f.name + '（点击直接打开预览）') : f.name;
     const hl = highlightedName(f.name, tokens);
     if (hl) nm.appendChild(hl); else setText(nm, f.name);
-    // 双击就地改名。只有能改的人（本人或管理员）才挂监听 ——
-    // 挂上去再在回调里判权限，双击时只会看到一个「看着能点、点了报错」的假入口。
-    if (canDeleteFile(f)) {
+
+    if (previewable) {
+      const openFn = () => openRepoPreview(f);
+      icon.title = '点击打开预览';
+      icon.addEventListener('click', openFn);
+      nm.addEventListener('click', openFn);
+    } else if (canDeleteFile(f)) {
       nm.classList.add('is-renamable');
       nm.addEventListener('dblclick', () => startRename(f, nm, tr));
     }
     textWrap.appendChild(nm);
-    // 置顶行在文件名后跟一个图钉标记：光靠背景色区分，
-    // 在深色/浅色主题下都容易被当成 hover 态。
+
     if (f.pinned) {
       const pin = document.createElement('span');
       pin.className = 'fpin';
@@ -1931,95 +2639,406 @@ function renderFiles() {
       pin.innerHTML = PIN_SVG;
       textWrap.appendChild(pin);
     }
+    if (searching && f.folderId) {
+      const tag = document.createElement('span');
+      tag.className = 'fpath-tag';
+      tag.title = folderPathText(f.folderId);
+      setText(tag, folderPathText(f.folderId));
+      textWrap.appendChild(tag);
+    }
 
     wrap.append(icon, textWrap);
     tdName.appendChild(wrap);
 
-    // 大小
     const tdSize = document.createElement('td');
     tdSize.className = 'cell-size';
     setText(tdSize, f.sizeText || humanSize(f.size));
 
-    // 时间
     const tdTime = document.createElement('td');
     tdTime.className = 'cell-time';
     setText(tdTime, fmtTime(f.createdAt));
 
-    // 上传者
     const tdOwner = document.createElement('td');
     tdOwner.className = 'cell-owner';
     setText(tdOwner, f.owner || '—');
 
-    // 操作：下载对所有人开放；置顶与删除只给「能动的的人」渲染。
     const tdAct = document.createElement('td');
     tdAct.className = 'cell-act';
-
-    const dl = document.createElement('a');
-    dl.className = 'btn btn-icon';
-    dl.href = f.downloadUrl;
-    dl.title = '下载';
-    dl.setAttribute('aria-label', '下载 ' + f.name);
-    dl.download = f.name;
-    dl.innerHTML = '<svg viewBox="0 0 20 20" width="16" height="16">'
-      + '<path d="M10 3.5v8.6M6.6 9l3.4 3.4L13.4 9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>'
-      + '<path d="M4 15.5h12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>';
-    tdAct.appendChild(dl);
+    tdAct.appendChild(buildDownloadLink(f));
 
     if (canDeleteFile(f)) {
-      const pin = document.createElement('button');
-      pin.className = 'btn btn-icon';
-      if (f.pinned) pin.classList.add('is-active');
-      pin.title = f.pinned ? '取消置顶' : '置顶';
-      pin.setAttribute('aria-label', pin.title + ' ' + f.name);
-      pin.innerHTML = PIN_SVG;
-      pin.addEventListener('click', () => togglePin(f, tr));
-      tdAct.appendChild(pin);
-
-      const del = document.createElement('button');
-      del.className = 'btn btn-icon is-danger';
-      del.title = '删除';
-      del.setAttribute('aria-label', '删除 ' + f.name);
-      del.innerHTML = '<svg viewBox="0 0 20 20" width="16" height="16">'
-        + '<path d="M4.5 6h11M8 6V4.6a1 1 0 011-1h2a1 1 0 011 1V6M6.5 6l.7 9.2a1.4 1.4 0 001.4 1.3h2.8a1.4 1.4 0 001.4-1.3L13.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-      del.addEventListener('click', () => deleteFile(f, tr));
-      tdAct.appendChild(del);
+      tdAct.appendChild(buildRenameBtn('重命名', () => startRename(f, nm, tr)));
+      tdAct.appendChild(buildPinBtn(f, tr));
+      tdAct.appendChild(buildDeleteBtn(f.name, () => deleteFile(f, tr)));
+      attachDraggable(tr, { type: 'file', id: f.id, name: f.name });
     }
 
     tr.append(tdName, tdSize, tdTime, tdOwner, tdAct);
     body.appendChild(tr);
   });
-
-  // 置顶顺序由服务端决定，前端不需要在渲染后再做任何对齐/排序补偿。
 }
 
-/** 图钉图标。表格里的置顶标记与置顶按钮共用一份，避免两处笔画出偏差。 */
-const PIN_SVG = '<svg viewBox="0 0 20 20" width="16" height="16">'
-  + '<path d="M12.6 3.2a1 1 0 011.5.1l2.6 2.6a1 1 0 01-.1 1.5l-1.9 1.5-.4 3.1a.8.8 0 01-1.3.6L10 9.9l-3.4 3.4a.6.6 0 01-.9-.9L9.1 9 6.4 6.3a.8.8 0 01.6-1.3l3.1-.4 1.5-1.9z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>'
-  + '<path d="M5.6 14.4l-1.9 1.9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+function renderFilesGrid(folders, files, tokens, searching, curFolder) {
+  const grid = $('#fileGrid');
+  if (!grid) return;
+  grid.innerHTML = '';
 
-/** 当前身份能否改/置顶/删这个文件。
- *
- * 与服务端 writableFile 的规则一一对应，避免给用户点一个必然 403 的按钮。
- * 这只是**界面上的礼貌**，真正的闸门在服务端 —— 前端隐藏按钮不算安全措施。
- */
-function canDeleteFile(f) {
-  if (!state.user) return false;
-  if (state.user.isAdmin) return true;
-  return !!f.owner && f.owner === state.user.username;
+  if (!searching && curFolder) {
+    const parentId = curFolder.parentId || null;
+    const card = document.createElement('div');
+    card.className = 'fcard is-up';
+
+    const thumb = document.createElement('div');
+    thumb.className = 'fcard-thumb';
+    thumb.classList.add('has-svg');
+    const badge = document.createElement('span');
+    badge.className = 'fcard-svg-icon is-up';
+    badge.innerHTML = UP_SVG;
+    thumb.appendChild(badge);
+
+    const info = document.createElement('div');
+    info.className = 'fcard-info';
+    const nm = document.createElement('div');
+    nm.className = 'fcard-name';
+    setText(nm, '.. 返回上一级');
+    const meta = document.createElement('div');
+    meta.className = 'fcard-meta';
+    setText(meta, parentId ? folderPathText(parentId) : '根目录');
+    info.append(nm, meta);
+
+    card.append(thumb, info);
+    card.addEventListener('click', () => enterFolder(parentId));
+    attachDropTarget(card, parentId);
+    grid.appendChild(card);
+  }
+
+  folders.forEach((folder) => {
+    const card = document.createElement('div');
+    card.className = 'fcard is-folder';
+    card.dataset.folderId = folder.id;
+
+    const thumb = document.createElement('div');
+    thumb.className = 'fcard-thumb';
+    thumb.classList.add('has-svg', 'is-folder-thumb');
+    const badge = document.createElement('span');
+    badge.className = 'fcard-svg-icon is-folder';
+    badge.innerHTML = FOLDER_SVG;
+    thumb.appendChild(badge);
+
+    if (canEditFolder(folder)) {
+      const acts = document.createElement('div');
+      acts.className = 'fcard-actions';
+      acts.appendChild(buildRenameBtn('重命名文件夹', () => openFolderModal('rename', folder)));
+      acts.appendChild(buildDeleteBtn(folder.name, () => deleteFolder(folder, card)));
+      thumb.appendChild(acts);
+      attachDraggable(card, { type: 'folder', id: folder.id, name: folder.name });
+    }
+
+    const info = document.createElement('div');
+    info.className = 'fcard-info';
+    const nm = document.createElement('div');
+    nm.className = 'fcard-name';
+    nm.title = folder.name;
+    const hl = highlightedName(folder.name, tokens);
+    if (hl) nm.appendChild(hl); else setText(nm, folder.name);
+
+    const cnt = folderChildCount(folder.id);
+    const meta = document.createElement('div');
+    meta.className = 'fcard-meta';
+    setText(meta, (cnt > 0 ? cnt + ' 项' : '空文件夹') + ' · ' + fmtTime(folder.createdAt));
+
+    info.append(nm, meta);
+    if (searching && folder.parentId) {
+      const p = document.createElement('div');
+      p.className = 'fcard-path';
+      setText(p, folderPathText(folder.parentId));
+      info.appendChild(p);
+    }
+
+    card.append(thumb, info);
+    card.addEventListener('click', () => enterFolder(folder.id));
+    attachDropTarget(card, folder.id);
+    grid.appendChild(card);
+  });
+
+  files.forEach((f) => {
+    const card = document.createElement('div');
+    const previewable = isRepoPreviewable(f);
+    card.className = 'fcard'
+      + (f.pinned ? ' is-pinned' : '')
+      + (previewable ? ' is-previewable' : '');
+    card.dataset.id = f.id;
+    card.title = previewable
+      ? (f.name + '（双击打开预览）')
+      : (f.name + '（双击下载）');
+
+    const thumb = document.createElement('div');
+    thumb.className = 'fcard-thumb';
+    const ext = extOf(f.name);
+
+    const makeIcon = () => {
+      const badge = document.createElement('span');
+      badge.className = 'fcard-svg-icon is-file';
+      badge.innerHTML = fileIconSVG(f.name);
+      return badge;
+    };
+
+    if (isRepoImage(f)) {
+      const img = document.createElement('img');
+      img.src = f.downloadUrl + '?inline=1';
+      img.alt = f.name;
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.draggable = false;
+      img.addEventListener('error', () => {
+        thumb.classList.add('has-svg');
+        img.replaceWith(makeIcon());
+      });
+      thumb.appendChild(img);
+    } else {
+      thumb.classList.add('has-svg');
+      thumb.appendChild(makeIcon());
+    }
+
+    if (f.pinned) {
+      const pinTag = document.createElement('span');
+      pinTag.className = 'fcard-pin';
+      pinTag.title = '已置顶';
+      pinTag.innerHTML = PIN_SVG;
+      thumb.appendChild(pinTag);
+    }
+
+    const dl = buildDownloadLink(f);
+    const acts = document.createElement('div');
+    acts.className = 'fcard-actions';
+    acts.appendChild(dl);
+
+    const info = document.createElement('div');
+    info.className = 'fcard-info';
+    const nm = document.createElement('div');
+    nm.className = 'fcard-name';
+    nm.title = f.name;
+    const hl = highlightedName(f.name, tokens);
+    if (hl) nm.appendChild(hl); else setText(nm, f.name);
+
+    const meta = document.createElement('div');
+    meta.className = 'fcard-meta';
+    setText(meta, (f.sizeText || humanSize(f.size)) + ' · ' + fmtTime(f.createdAt));
+
+    info.append(nm, meta);
+    if (searching && f.folderId) {
+      const p = document.createElement('div');
+      p.className = 'fcard-path';
+      setText(p, folderPathText(f.folderId));
+      info.appendChild(p);
+    }
+
+    if (canDeleteFile(f)) {
+      acts.appendChild(buildRenameBtn('重命名', () => startRename(f, nm, card)));
+      acts.appendChild(buildPinBtn(f, card));
+      acts.appendChild(buildDeleteBtn(f.name, () => deleteFile(f, card)));
+      attachDraggable(card, { type: 'file', id: f.id, name: f.name });
+    }
+    thumb.appendChild(acts);
+
+    card.append(thumb, info);
+    card.addEventListener('dblclick', () => {
+      if (previewable) {
+        openRepoPreview(f);
+      } else {
+        dl.click();
+      }
+    });
+    grid.appendChild(card);
+  });
 }
 
-/** 双击文件名后就地改名。
- *
- * 用 input 替换 .fname 的文本，而不是 contenteditable：
- * contenteditable 会把富文本粘贴带进来（换行、样式片段），
- * 而文件名是纯文本，还得自己再洗一遍，不如一开始就用 input 干净。
- *
- * 提交时机有三个：Enter、失焦、以及「点了别处」——
- * 其中 Esc 是唯一的中止路径，其余一律当作确认提交。
- */
-function startRename(f, nm, tr) {
-  // 已经在编辑了（例如双击了两次），别叠出第二个输入框。
-  if (tr.querySelector('.fname-edit')) return;
+/* ------------------------------------------------- 文件夹弹窗与操作 */
+
+const folderModalState = { mode: 'create', folder: null };
+
+function openFolderModal(mode, folder) {
+  if (!state.user) {
+    toast('请先登录后再管理文件夹', 'err');
+    openAuth('login');
+    return;
+  }
+  const modal = $('#folderModal');
+  if (!modal) return;
+
+  folderModalState.mode = mode === 'rename' && folder ? 'rename' : 'create';
+  folderModalState.folder = folder || null;
+
+  const isRename = folderModalState.mode === 'rename';
+  setText($('#folderModalTitle'), isRename ? '重命名文件夹' : '新建文件夹');
+  setText($('#folderModalSub'), isRename
+    ? '修改「' + folder.name + '」的名称'
+    : '将在「' + folderPathText(state.currentFolderId) + '」下创建');
+  setText($('#btnDoFolder'), isRename ? '保存' : '创建');
+  setText($('#folderMsg'), '');
+
+  const input = $('#folderNameInput');
+  input.value = isRename ? folder.name : '';
+  modal.hidden = false;
+  setTimeout(() => {
+    input.focus();
+    if (isRename) input.select();
+  }, 30);
+}
+
+function closeFolderModal() {
+  const modal = $('#folderModal');
+  if (modal) modal.hidden = true;
+}
+
+async function submitFolderModal(e) {
+  if (e) e.preventDefault();
+  const btn = $('#btnDoFolder');
+  if (btn.disabled) return;
+
+  const name = trim($('#folderNameInput').value);
+  if (!name) {
+    setText($('#folderMsg'), '请输入文件夹名称');
+    return;
+  }
+
+  const isRename = folderModalState.mode === 'rename' && folderModalState.folder;
+  if (isRename && name === folderModalState.folder.name) {
+    closeFolderModal();
+    return;
+  }
+
+  btn.disabled = true;
+  setText($('#folderMsg'), '');
+  try {
+    const url = isRename ? ('/api/folders/' + folderModalState.folder.id) : '/api/folders';
+    const method = isRename ? 'PATCH' : 'POST';
+    const payload = isRename ? { name } : { name, parentId: state.currentFolderId || 0 };
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setText($('#folderMsg'), data.error || (isRename ? '重命名失败' : '创建失败'));
+      return;
+    }
+    closeFolderModal();
+    toast((isRename ? '已重命名为：' : '已创建文件夹：') + data.name, 'ok');
+    await loadFiles();
+  } catch (_) {
+    setText($('#folderMsg'), '网络错误，请重试');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function deleteFolder(folder, container) {
+  const cnt = folderChildCount(folder.id);
+  const msg = cnt > 0
+    ? '确定删除文件夹「' + folder.name + '」？其中的 ' + cnt + ' 个子项将移回上级目录。'
+    : '确定删除空文件夹「' + folder.name + '」？';
+  if (!window.confirm(msg)) return;
+
+  if (container) container.classList.add('is-busy');
+  try {
+    const res = await fetch('/api/folders/' + folder.id, { method: 'DELETE' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast(data.error || '删除文件夹失败', 'err');
+      if (container) container.classList.remove('is-busy');
+      return;
+    }
+    if (state.currentFolderId === folder.id) {
+      state.currentFolderId = folder.parentId || null;
+    }
+    toast('已删除文件夹：' + folder.name, 'ok');
+    await loadFiles();
+  } catch (_) {
+    toast('网络错误，删除文件夹失败', 'err');
+    if (container) container.classList.remove('is-busy');
+  }
+}
+
+/* ------------------------------------------------- TXT 文本预览弹窗 */
+
+let textPreviewReq = 0;
+
+function decodeTextBuffer(buf) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch (_) {
+    try {
+      return new TextDecoder('gb18030').decode(buf);
+    } catch (_) {
+      return new TextDecoder('utf-8').decode(buf);
+    }
+  }
+}
+
+async function openTextPreview(f) {
+  const modal = $('#textModal');
+  const body = $('#textPreviewBody');
+  const notice = $('#textModalNotice');
+  if (!modal || !body) return;
+
+  const reqId = ++textPreviewReq;
+  setText($('#textModalName'), f.name || '文本预览');
+  setText($('#textModalMeta'), (f.sizeText || humanSize(f.size)) + ' · ' + fmtTime(f.createdAt));
+
+  const dl = $('#textModalDownload');
+  if (dl) {
+    dl.href = f.downloadUrl;
+    dl.setAttribute('download', f.name || '');
+  }
+
+  const MAX_FULL_BYTES = 2 * 1024 * 1024;
+  const PREVIEW_BYTES = 512 * 1024;
+  const isTruncated = Number(f.size) > MAX_FULL_BYTES;
+
+  if (notice) {
+    if (isTruncated) {
+      setText(notice, '文件较大（' + (f.sizeText || humanSize(f.size)) + '），仅预览前 512 KB；完整内容请点击右上角下载。');
+      notice.hidden = false;
+    } else {
+      notice.hidden = true;
+    }
+  }
+
+  body.textContent = '正在加载文本内容…';
+  modal.hidden = false;
+
+  try {
+    const headers = isTruncated ? { Range: 'bytes=0-' + (PREVIEW_BYTES - 1) } : {};
+    const res = await fetch(f.downloadUrl + '?inline=1', { headers });
+    if (reqId !== textPreviewReq || modal.hidden) return;
+    if (!res.ok) {
+      body.textContent = '加载失败（HTTP ' + res.status + '），请点击右上角下载后查看。';
+      return;
+    }
+    const buf = await res.arrayBuffer();
+    if (reqId !== textPreviewReq || modal.hidden) return;
+    body.textContent = decodeTextBuffer(buf);
+  } catch (_) {
+    if (reqId === textPreviewReq && !modal.hidden) {
+      body.textContent = '网络错误，无法读取文件内容，请尝试下载。';
+    }
+  }
+}
+
+function closeTextModal() {
+  const modal = $('#textModal');
+  if (!modal || modal.hidden) return;
+  textPreviewReq++;
+  modal.hidden = true;
+  const body = $('#textPreviewBody');
+  if (body) body.textContent = '';
+}
+
+/** 就地重命名文件（列表与卡片视图共用）。 */
+function startRename(f, nm, container) {
+  if (container.querySelector('.fname-edit')) return;
 
   const input = document.createElement('input');
   input.className = 'fname-edit';
@@ -2030,18 +3049,15 @@ function startRename(f, nm, tr) {
 
   let settled = false;
   const finish = async (commit) => {
-    // Enter 之后浏览器会紧接着触发 blur，两个入口会重复提交一次改名。
-    // 用一个标志位保证只结算一次。
     if (settled) return;
     settled = true;
 
     const next = (input.value || '').trim();
     input.replaceWith(nm);
 
-    // 没改、或改成了空 —— 都当取消，不发请求。
     if (!commit || !next || next === f.name) return;
 
-    tr.classList.add('is-busy');
+    container.classList.add('is-busy');
     try {
       const res = await fetch('/api/files/' + f.id, {
         method: 'PATCH',
@@ -2051,39 +3067,19 @@ function startRename(f, nm, tr) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         toast(data.error || '重命名失败', 'err');
-        tr.classList.remove('is-busy');
+        container.classList.remove('is-busy');
         return;
       }
-      // 服务端可能对名字做了清洗（去路径、截断），以它返回的为准。
-      f.name = data.name || next;
-      nm.title = f.name;
-      setText(nm, f.name);
-      // 扩展名可能变了，图标要跟着换。
-      const icon = tr.querySelector('.ftype');
-      if (icon) {
-        const ne = extOf(f.name);
-        icon.dataset.t = ne;
-        setText(icon, ne ? ne.slice(0, 4) : 'FILE');
-      }
-      // 下载按钮的 download 属性也要同步，否则存下来的还是旧名字。
-      const dl = tr.querySelector('a.btn-icon');
-      if (dl) {
-        dl.download = f.name;
-        dl.setAttribute('aria-label', '下载 ' + f.name);
-      }
-      tr.classList.remove('is-busy');
-      toast('已重命名为：' + f.name, 'ok');
-      // 搜索态下整表重绘：新名字可能不再命中（这一行该消失），
-      // 也可能换了个位置命中（高亮要跟着挪）。就地改文字两件都做不到，
-      // 会留下一条「明明不匹配却还在列表里」的幽灵行。
-      // 没有搜索词时不重绘 —— 那是纯粹的重建，只会闪一下。
-      if (trim(state.fileQuery)) renderFiles();
+      toast('已重命名为：' + (data.name || next), 'ok');
+      await loadFiles();
     } catch (_) {
-      tr.classList.remove('is-busy');
+      container.classList.remove('is-busy');
       toast('网络错误，重命名失败', 'err');
     }
   };
 
+  input.addEventListener('click', (e) => e.stopPropagation());
+  input.addEventListener('dblclick', (e) => e.stopPropagation());
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -2092,66 +3088,58 @@ function startRename(f, nm, tr) {
       e.preventDefault();
       finish(false);
     }
-    // 其余按键不拦，正常输入。
   });
   input.addEventListener('blur', () => finish(true));
 
   nm.replaceWith(input);
   input.focus();
-  // 光标放在扩展名之前，这样直接打字替换的是主文件名，
-  // 想连扩展名一起改的话按 End 即可 —— 比全选更少误操作。
   const dot = input.value.lastIndexOf('.');
   const caret = dot > 0 ? dot : input.value.length;
   input.setSelectionRange(0, caret);
 }
 
 /** 切换置顶，并用服务端返回的完整列表重排。 */
-async function togglePin(f, tr) {
-  tr.classList.add('is-busy');
+async function togglePin(f, container) {
+  container.classList.add('is-busy');
   try {
     const res = await fetch('/api/files/' + f.id + '/pin', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // 不传 pinned，让服务端翻转 —— 前端少算一次，也就没有「按钮上的状态
-      // 和数据库里的状态不一致」导致的翻错方向。
       body: JSON.stringify({}),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       toast(data.error || '设置置顶失败', 'err');
-      tr.classList.remove('is-busy');
+      container.classList.remove('is-busy');
       return;
     }
     toast(data.pinned ? '已置顶：' + data.name : '已取消置顶：' + data.name, 'ok');
-    // 顺序是服务端决定的（pinned DESC, created_at DESC），
-    // 所以直接重新拉一遍，而不是在本地数组里挪位置 —— 后者会和服务端算出的
-    // 顺序有出入（置顶项之间也有先后），久了就变成两套排序逻辑。
     await loadFiles();
   } catch (_) {
-    tr.classList.remove('is-busy');
+    container.classList.remove('is-busy');
     toast('网络错误，设置置顶失败', 'err');
   }
 }
 
-async function deleteFile(f, tr) {
+async function deleteFile(f, container) {
   if (!window.confirm('确定删除「' + f.name + '」？此操作不可恢复。')) return;
 
-  tr.classList.add('is-busy');
+  container.classList.add('is-busy');
   try {
     const res = await fetch('/api/files/' + f.id, { method: 'DELETE' });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       toast(data.error || '删除失败', 'err');
-      tr.classList.remove('is-busy');
+      container.classList.remove('is-busy');
       return;
     }
     toast('已删除：' + f.name, 'ok');
-    state.files = state.files.filter((x) => x.id !== f.id);
-    renderFiles();
     setStatus('已删除 ' + f.name, '');
+    await loadFiles();
+    refreshStatus();
   } catch (_) {
     toast('网络错误，删除失败', 'err');
-    tr.classList.remove('is-busy');
+    container.classList.remove('is-busy');
   }
 }
 
@@ -2248,11 +3236,13 @@ function uploadOne(file, ui) {
   const finished = new Promise((r) => { markDone = r; });
 
   const form = new FormData();
-  // 顺序有讲究：必须先把 kind / name 放进 FormData，再放文件。
+  // 顺序有讲究：必须先把 kind / folderId / name 放进 FormData，再放文件。
   // 服务端是流式解析 multipart —— 遇到文件 part 就立刻开始边收边写，
-  // 排在文件后面的字段它已经读不到了，kind 拿不到就会按最严格的
-  // 「永久文件（需登录）」处理。
+  // 排在文件后面的字段它已经读不到了。
   form.append('kind', 'permanent');
+  if (state.currentFolderId) {
+    form.append('folderId', String(state.currentFolderId));
+  }
   form.append('name', file.name);
   form.append('file', file, file.name);
 
@@ -2291,6 +3281,7 @@ function uploadOne(file, ui) {
         if (!box.children.length) box.hidden = true;
       }, 1200);
       loadFiles();
+      refreshStatus();
     } else {
       row.classList.add('is-error');
       setText(pct, '失败');
@@ -2542,8 +3533,35 @@ function bindEvents() {
   });
   $('#btnSend').addEventListener('click', sendMessage);
 
+  // ---- 主题切换 ----
+  $$('#themeSwitch [data-theme-opt]').forEach((btn) => {
+    btn.addEventListener('click', () => applyTheme(btn.dataset.themeOpt, true));
+  });
+
   // ---- 文件 ----
   $('#btnUpload').addEventListener('click', pickFiles);
+  $('#btnNewFolder').addEventListener('click', () => openFolderModal('create'));
+  $$('#viewSwitch .view-btn').forEach((btn) => {
+    btn.addEventListener('click', () => setFileView(btn.dataset.view));
+  });
+
+  // ---- 文件夹弹窗 ----
+  $('#folderForm').addEventListener('submit', submitFolderModal);
+  $('#btnCloseFolder').addEventListener('click', closeFolderModal);
+  $('#folderModal').addEventListener('mousedown', (e) => {
+    if (e.target === $('#folderModal')) closeFolderModal();
+  });
+
+  // ---- TXT 预览弹窗 ----
+  $('#btnCloseText').addEventListener('click', closeTextModal);
+  $('#btnCopyText').addEventListener('click', async () => {
+    const body = $('#textPreviewBody');
+    const ok = await copyText(body ? body.textContent : '');
+    toast(ok ? '已复制文本内容' : '复制失败，请手动选择', ok ? 'ok' : 'err');
+  });
+  $('#textModal').addEventListener('mousedown', (e) => {
+    if (e.target === $('#textModal')) closeTextModal();
+  });
 
   // ---- 文件搜索（纯前端过滤，不请求服务端）----
   const searchInput = $('#fileSearch');
@@ -2644,31 +3662,96 @@ function bindEvents() {
   });
 
   // ---- 图片灯箱 ----
-  // 点背景（而不是点在图上或工具条上）才关，否则想选个图都会被关掉。
+  // 点背景（而不是点在图上或工具条上）才关；左键拖动后松手不触发关闭。
   const lb = $('#lightbox');
   if (lb) {
+    const stage = $('#lightboxStage');
+    const img = $('#lightboxImg');
     lb.addEventListener('click', (e) => {
-      const stage = $('#lightboxStage');
-      const rect = stage.getBoundingClientRect();
-      const onBackground = e.target === stage
-        && e.clientX < rect.left + stage.clientWidth
-        && e.clientY < rect.top + stage.clientHeight;
-      if (e.target === lb || onBackground) closeLightbox();
+      if (lightboxView.suppressClick) {
+        lightboxView.suppressClick = false;
+        return;
+      }
+      if (e.target === lb || (stage && e.target === stage)) closeLightbox();
     });
+    if (stage && img) {
+      stage.addEventListener('wheel', (e) => {
+        if (lb.hidden || !img.naturalWidth) return;
+        e.preventDefault();
+        let dy = e.deltaY;
+        if (e.deltaMode === 1) dy *= 16;
+        else if (e.deltaMode === 2) dy *= 400;
+        dy = Math.max(-240, Math.min(240, dy));
+        if (!dy) return;
+        const factor = Math.exp(-dy * 0.0018);
+        setLightboxScale(lightboxView.scale * factor, false, { x: e.clientX, y: e.clientY });
+      }, { passive: false });
+
+      img.addEventListener('dragstart', (e) => e.preventDefault());
+      img.addEventListener('pointerdown', (e) => {
+        if (lb.hidden || !img.naturalWidth) return;
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        e.preventDefault();
+        lightboxView.dragging = true;
+        lightboxView.pointerId = e.pointerId;
+        lightboxView.startX = e.clientX;
+        lightboxView.startY = e.clientY;
+        lightboxView.startTx = lightboxView.tx;
+        lightboxView.startTy = lightboxView.ty;
+        lightboxView.moved = false;
+        stage.classList.add('is-dragging');
+        try { img.setPointerCapture(e.pointerId); } catch (_) {}
+      });
+      img.addEventListener('pointermove', (e) => {
+        if (!lightboxView.dragging || e.pointerId !== lightboxView.pointerId) return;
+        const dx = e.clientX - lightboxView.startX;
+        const dy = e.clientY - lightboxView.startY;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+          lightboxView.moved = true;
+          lightboxView.fit = false;
+        }
+        lightboxView.tx = lightboxView.startTx + dx;
+        lightboxView.ty = lightboxView.startTy + dy;
+        clampLightboxOffset();
+        applyLightboxTransform();
+      });
+      const endLightboxDrag = (e) => {
+        if (!lightboxView.dragging) return;
+        if (e && lightboxView.pointerId !== null && e.pointerId !== lightboxView.pointerId) return;
+        const wasMoved = lightboxView.moved;
+        const pid = lightboxView.pointerId;
+        lightboxView.dragging = false;
+        lightboxView.pointerId = null;
+        lightboxView.moved = false;
+        stage.classList.remove('is-dragging');
+        if (pid !== null && img.hasPointerCapture && img.hasPointerCapture(pid)) {
+          try { img.releasePointerCapture(pid); } catch (_) {}
+        }
+        if (wasMoved) {
+          lightboxView.suppressClick = true;
+          setTimeout(() => { lightboxView.suppressClick = false; }, 0);
+        }
+      };
+      img.addEventListener('pointerup', endLightboxDrag);
+      img.addEventListener('pointercancel', endLightboxDrag);
+      img.addEventListener('lostpointercapture', endLightboxDrag);
+    }
     const closeBtn = $('#btnCloseLightbox');
     if (closeBtn) closeBtn.addEventListener('click', closeLightbox);
     $('#btnZoomOut').addEventListener('click', () => setLightboxScale(lightboxView.scale / 1.25));
     $('#btnZoomIn').addEventListener('click', () => setLightboxScale(lightboxView.scale * 1.25));
     $('#btnZoomFit').addEventListener('click', () => setLightboxScale(1, true));
-    $('#btnZoomActual').addEventListener('click', () => setLightboxScale(1));
+    $('#btnZoomActual').addEventListener('click', () => setLightboxScale(1, false, { reset: true }));
     window.addEventListener('resize', () => setLightboxScale(lightboxView.scale, lightboxView.fit));
   }
 
   // ---- 快捷键 ----
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    // 灯箱优先级最高：它是全屏遮罩，先关它再谈别的弹窗。
+    // 灯箱与预览弹窗优先级最高，先关顶层再关下层。
     if (!$('#lightbox').hidden) { closeLightbox(); return; }
+    if (!$('#textModal').hidden) { closeTextModal(); return; }
+    if (!$('#folderModal').hidden) { closeFolderModal(); return; }
     if (!$('#adminModal').hidden) { closeAdmin(); return; }
     if (!$('#createModal').hidden) { closeCreate(); return; }
     if (!$('#loginModal').hidden) closeLogin();
@@ -2690,6 +3773,7 @@ function bindEvents() {
 }
 
 function hasFiles(e) {
+  if (draggingItem) return false;
   if (!e.dataTransfer) return false;
   const t = e.dataTransfer.types;
   if (!t) return false;
@@ -2753,15 +3837,22 @@ function setupDropZone(pane, opts) {
   });
 }
 
-/** 从 localStorage 恢复上次的会话码。 */
+/** 从 localStorage 恢复上次的会话码、视图模式与界面主题。 */
 function restoreLocal() {
   // 不自动重连会话 —— 会话是临时的，自动恢复会让用户莫名其妙进到旧房间。
   // 只把上次的码填进输入框，方便一键回去。
+  let theme = 'auto';
   try {
     const c = localStorage.getItem(LS_CODE);
     const el = $('#joinCode');
     if (c && el) el.value = c;
+    const v = localStorage.getItem(LS_FILE_VIEW);
+    if (v === 'card' || v === 'list') state.fileView = v;
+    const t = localStorage.getItem(LS_THEME);
+    if (t === 'light' || t === 'dark') theme = t;
   } catch (_) {}
+  syncViewButtons();
+  applyTheme(theme, false);
 }
 
 /**
@@ -2787,7 +3878,6 @@ async function init() {
   autoGrow($('#msgInput'));
   startRelativeTimer();
 
-  setNet('warn', '检测中…');
   setStatus('正在读取状态…', '');
 
   await loadMe();
@@ -2809,10 +3899,7 @@ async function init() {
     }
   } catch (_) {
     setStatus('无法连接服务', '');
-    setNet('bad', '离线');
   }
-
-  if (!state.room) setNet('idle', '未连接');
 }
 
 if (document.readyState === 'loading') {

@@ -4,6 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
+<script>
+  try {
+    var t = localStorage.getItem('lanshare.theme');
+    if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+  } catch (_) {}
+</script>
 <title>LAN Share · 局域网传输</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%233b6ff5'/><path d='M9 21l7-11 7 11' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
 <link rel="stylesheet" href="/css/style.css">
@@ -23,9 +29,25 @@
   </div>
 
   <div class="topbar-right">
-    <span class="pill" id="netPill" title="与路由器的连接状态">
-      <i class="dot dot-idle"></i><span id="netText">未连接</span>
-    </span>
+    <div class="view-switch theme-switch" id="themeSwitch" role="group" aria-label="切换主题">
+      <button type="button" class="view-btn" id="btnThemeLight" data-theme-opt="light" title="浅色主题" aria-label="浅色主题" aria-pressed="false">
+        <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+          <circle cx="10" cy="10" r="3.4" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M10 2.6v2M10 15.4v2M2.6 10h2M15.4 10h2M4.8 4.8l1.4 1.4M13.8 13.8l1.4 1.4M15.2 4.8l-1.4 1.4M6.2 13.8l-1.4 1.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <button type="button" class="view-btn" id="btnThemeDark" data-theme-opt="dark" title="深色主题" aria-label="深色主题" aria-pressed="false">
+        <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+          <path d="M15.6 12.6A6.4 6.4 0 017.4 4.4a6.5 6.5 0 108.2 8.2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+        </svg>
+      </button>
+      <button type="button" class="view-btn is-active" id="btnThemeAuto" data-theme-opt="auto" title="跟随系统主题" aria-label="跟随系统主题" aria-pressed="true">
+        <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+          <rect x="2.8" y="3.8" width="14.4" height="10" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M7.5 16.4h5M10 13.8v2.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
     <button class="btn btn-ghost btn-sm" id="btnAdmin" hidden title="管理员选项">管理</button>
     <div id="userArea" class="user-area">
       <!-- 由 JS 渲染：未登录显示「登录」，已登录显示用户名 + 登出 -->
@@ -141,6 +163,22 @@
           <button type="button" class="search-clear" id="btnClearSearch" hidden
                   aria-label="清除搜索" title="清除搜索">×</button>
         </div>
+        <div class="view-switch" id="viewSwitch" role="group" aria-label="视图切换">
+          <button type="button" class="view-btn is-active" data-view="list" aria-pressed="true" title="列表视图">
+            <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+              <path d="M4 5.5h12M4 10h12M4 14.5h12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            </svg>
+          </button>
+          <button type="button" class="view-btn" data-view="card" aria-pressed="false" title="卡片视图">
+            <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+              <rect x="3.5" y="3.5" width="5.5" height="5.5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+              <rect x="11" y="3.5" width="5.5" height="5.5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+              <rect x="3.5" y="11" width="5.5" height="5.5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+              <rect x="11" y="11" width="5.5" height="5.5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+            </svg>
+          </button>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="btnNewFolder" title="在当前目录新建文件夹">新建文件夹</button>
         <button class="btn btn-primary btn-sm" id="btnUpload">上传文件</button>
         <input type="file" id="fileInput" hidden multiple>
       </div>
@@ -159,9 +197,15 @@
     <!-- 用量条 -->
     <div class="usage" id="usageBar">
       <span id="usageText">—</span>
+      <div class="usage-bar-track" id="usageTrack" hidden aria-hidden="true">
+        <div class="usage-bar-fill" id="usageFill"></div>
+      </div>
       <span class="usage-hint" id="usageHint"></span>
       <span class="usage-limit" id="fileLimitHint" hidden></span>
     </div>
+
+    <!-- 面包屑路径条（进入子文件夹或存在文件夹时展示，支持拖拽移回上级） -->
+    <nav class="folder-bar" id="folderBar" hidden aria-label="文件夹路径"></nav>
 
     <!-- 上传进度 -->
     <div class="upload-list" id="uploadList" hidden></div>
@@ -189,7 +233,7 @@
        改成 `table-layout: fixed` 之后列宽只由 <colgroup> 决定，
        长文件名不再把「大小 / 时间」两列挤走（那是原来最明显的对齐毛病）。 -->
   <div class="file-scroll">
-    <div class="file-table-wrap">
+    <div class="file-table-wrap" id="fileTableWrap">
       <table class="file-table" id="fileTable">
         <colgroup>
           <col class="col-name">
@@ -200,7 +244,7 @@
         </colgroup>
         <thead>
           <tr>
-            <th class="col-name">文件名</th>
+            <th class="col-name">名称</th>
             <th class="col-size">大小</th>
             <th class="col-time">时间</th>
             <th class="col-owner">上传者</th>
@@ -209,10 +253,11 @@
         </thead>
         <tbody id="fileBody"></tbody>
       </table>
-      <div class="table-empty" id="fileEmpty">
-        <p id="fileEmptyTitle">文件仓库还是空的</p>
-        <small id="fileEmptyHint">上传过的文件会长期保存在路由器数据分区</small>
-      </div>
+    </div>
+    <div class="file-grid" id="fileGrid" hidden></div>
+    <div class="table-empty" id="fileEmpty">
+      <p id="fileEmptyTitle">文件仓库还是空的</p>
+      <small id="fileEmptyHint">上传过的文件会长期保存在文件仓库</small>
     </div>
   </div>
 
@@ -324,13 +369,53 @@
   </div>
 </div>
 
+<!-- ============================= 新建 / 重命名文件夹弹窗 ============================= -->
+<div class="modal-backdrop" id="folderModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="folderModalTitle">
+    <h3 id="folderModalTitle">新建文件夹</h3>
+    <p class="modal-sub" id="folderModalSub">在当前目录创建文件夹</p>
+
+    <form id="folderForm">
+      <label class="field">
+        <span>文件夹名称</span>
+        <input class="input" id="folderNameInput" type="text" autocomplete="off"
+               spellcheck="false" maxlength="200" placeholder="输入文件夹名称" required>
+      </label>
+      <p class="form-msg" id="folderMsg"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="btnCloseFolder">取消</button>
+        <button type="submit" class="btn btn-primary" id="btnDoFolder">创建</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ============================= TXT 文本预览弹窗 ============================= -->
+<div class="modal-backdrop" id="textModal" hidden>
+  <div class="modal modal-text" role="dialog" aria-modal="true" aria-labelledby="textModalName">
+    <div class="text-modal-head">
+      <div class="text-modal-title">
+        <h3 id="textModalName">文本预览</h3>
+        <span class="text-modal-meta" id="textModalMeta"></span>
+      </div>
+      <div class="text-modal-actions">
+        <button type="button" class="btn btn-ghost btn-sm" id="btnCopyText">复制全文</button>
+        <a class="btn btn-ghost btn-sm" id="textModalDownload" download>下载</a>
+        <button type="button" class="btn btn-primary btn-sm" id="btnCloseText">关闭</button>
+      </div>
+    </div>
+    <p class="text-modal-notice" id="textModalNotice" hidden></p>
+    <pre class="text-preview-body" id="textPreviewBody"></pre>
+  </div>
+</div>
+
 <!-- ============================= 图片灯箱 =============================
      点聊天里的缩略图打开。刻意不复用 .modal-backdrop：
      那个类带卡片式的内边距与边框，套在图上会多出一圈白框。
      灯箱要的是纯暗底 + 居中大图，所以单独一套结构。 -->
 <div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true" aria-label="图片预览">
-  <div class="lightbox-stage" id="lightboxStage" tabindex="0" aria-label="图片，可滚动查看放大后的内容">
-    <img id="lightboxImg" alt="">
+  <div class="lightbox-stage" id="lightboxStage" tabindex="0" aria-label="图片预览区，可滚轮缩放、左键拖动位置">
+    <img id="lightboxImg" alt="" draggable="false">
   </div>
   <div class="lightbox-bar">
     <span class="lightbox-name" id="lightboxName"></span>

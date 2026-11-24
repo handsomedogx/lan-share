@@ -60,3 +60,8 @@ func ImageMIME(ext string) string {
 
 // IsImageName 判断文件名是否是白名单内的图片。
 func IsImageName(name string) bool { return ImageExt(name) != "" }
+
+// IsTextPreviewName 判断文件名是否为支持内联文本预览的纯文本文件（.txt）。
+func IsTextPreviewName(name string) bool {
+	return strings.ToLower(path.Ext(name)) == ".txt"
+}

@@ -1,5 +1,3 @@
-//go:build !windows
-
 package files
 
 import (
@@ -11,7 +9,7 @@ import (
 const impossibleSize int64 = 1 << 60
 
 func TestHasRoomForUploadRejectsImpossibleSize(t *testing.T) {
-	svc, err := New(t.TempDir(), 0)
+	svc, err := New(t.TempDir())
 	if err != nil {
 		t.Fatalf("创建文件服务失败: %v", err)
 	}
@@ -23,7 +21,7 @@ func TestHasRoomForUploadRejectsImpossibleSize(t *testing.T) {
 }
 
 func TestHasRoomForUploadAllowsReasonableSize(t *testing.T) {
-	svc, err := New(t.TempDir(), 0)
+	svc, err := New(t.TempDir())
 	if err != nil {
 		t.Fatalf("创建文件服务失败: %v", err)
 	}

@@ -28,6 +28,9 @@ type fileResp struct {
 	Owner       string `json:"owner"`
 	CreatedAt   int64  `json:"createdAt"`
 	Pinned      bool   `json:"pinned"`
+	FolderID    *int64 `json:"folderId,omitempty"`
+	IsImage     bool   `json:"isImage"`
+	IsText      bool   `json:"isText"`
 	DownloadURL string `json:"downloadUrl"`
 }
 
@@ -42,6 +45,9 @@ func toFileResp(f *storage.File) fileResp {
 		Owner:       f.OwnerName,
 		CreatedAt:   f.CreatedAt.UnixMilli(),
 		Pinned:      f.Pinned,
+		FolderID:    f.FolderID,
+		IsImage:     files.IsImageName(f.OriginalName),
+		IsText:      files.IsTextPreviewName(f.OriginalName),
 		DownloadURL: fmt.Sprintf("/api/files/%d", f.ID),
 	}
 }
@@ -73,6 +79,13 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	folders, err := s.store.ListFolders()
+	if err != nil {
+		s.log.Error("查询文件夹列表失败: %v", err)
+		httpx.Fail(w, http.StatusInternalServerError, "读取文件夹列表失败")
+		return
+	}
+
 	out := make([]fileResp, 0, len(list))
 	var total int64
 	for _, f := range list {
@@ -82,6 +95,7 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"files":     out,
+		"folders":   toFolderResps(folders),
 		"count":     len(out),
 		"totalSize": total,
 		"totalText": files.HumanSize(total),
@@ -114,6 +128,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			httpx.Fail(w, http.StatusInsufficientStorage, "磁盘空间不足，请先清理文件仓库")
 			return
 		}
+	}
+
+	// 仓库总容量上限预检（放在拿名额之前，超配额不必占用并发槽与磁盘）。
+	var estAdd int64
+	if r.ContentLength > multipartOverhead {
+		estAdd = r.ContentLength - multipartOverhead
+	}
+	if quotaErr := s.checkStorageQuota(estAdd); quotaErr != nil {
+		httpx.Fail(w, http.StatusInsufficientStorage, quotaErr.Error())
+		return
 	}
 
 	// 先排队等名额，再开始收数据 —— 被限流的请求不该占用带宽和磁盘。
@@ -156,6 +180,25 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var targetFolderID *int64
+	if rawFolder := up.Field("folderId"); rawFolder != "" && rawFolder != "0" {
+		fid, err := strconv.ParseInt(rawFolder, 10, 64)
+		if err != nil || fid <= 0 {
+			httpx.Fail(w, http.StatusBadRequest, "非法的文件夹 ID")
+			return
+		}
+		if _, err := s.store.FolderByID(fid); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				httpx.Fail(w, http.StatusNotFound, "目标文件夹不存在")
+				return
+			}
+			s.log.Error("查询目标文件夹失败: id=%d err=%v", fid, err)
+			httpx.Fail(w, http.StatusInternalServerError, "读取文件夹失败")
+			return
+		}
+		targetFolderID = &fid
+	}
+
 	displayName := files.SafeDisplayName(up.Field("name"))
 	if displayName == "file" {
 		displayName = files.SafeDisplayName(up.Filename)
@@ -179,6 +222,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		// 「网络中断」和「磁盘写满」这两类完全不同的故障。
 		s.log.Error("上传失败: name=%q duration=%s err=%v", displayName, durationText(elapsed), err)
 		httpx.Fail(w, http.StatusInternalServerError, "保存文件失败")
+		return
+	}
+
+	// 精确配额校验（落盘后已知准确字节数，防止 chunked 上传或并发绕过预检）。
+	if quotaErr := s.checkStorageQuota(res.Size); quotaErr != nil {
+		_ = s.files.Remove(string(kind), res.StoredName)
+		httpx.Fail(w, http.StatusInsufficientStorage, quotaErr.Error())
 		return
 	}
 
@@ -245,6 +295,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		OwnerID:      &ownerID,
 		OwnerName:    owner.Username,
 		CreatedAt:    nowTime(),
+		FolderID:     targetFolderID,
 	}
 
 	id, err := s.store.CreateFile(rec)
@@ -307,6 +358,27 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer fh.Close()
+
+	// inline=1 仅对安全白名单类型生效：位图图片与纯文本（.txt）。
+	// SVG/HTML 等可执行类型一律落回 attachment，避免同源脚本注入。
+	if r.URL.Query().Get("inline") == "1" {
+		if mime := files.ImageMIME(files.ImageExt(f.OriginalName)); mime != "" {
+			w.Header().Set("Content-Type", mime)
+			w.Header().Set("Content-Disposition", "inline"+contentDispositionTail(f.OriginalName))
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Cache-Control", "private, max-age=300")
+			http.ServeContent(w, r, f.OriginalName, f.CreatedAt, fh)
+			return
+		}
+		if files.IsTextPreviewName(f.OriginalName) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("Content-Disposition", "inline"+contentDispositionTail(f.OriginalName))
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Cache-Control", "private, max-age=60")
+			http.ServeContent(w, r, f.OriginalName, f.CreatedAt, fh)
+			return
+		}
+	}
 
 	// Content-Disposition 用 filename*=UTF-8'' 形式，保证中文名正确显示。
 	// attachment 而非 inline：避免浏览器把上传的 html/svg 当成页面执行。
@@ -418,20 +490,21 @@ func shouldKeepOnDisk(f *storage.File) bool {
 
 // ---------------------------------------------------------------- 改名 / 置顶
 
-// renameReq 是改名请求体。
+// renameReq 是文件更新请求体（支持改名与移动目录）。
 type renameReq struct {
-	Name string `json:"name"`
+	Name     *string `json:"name"`
+	FolderID *int64  `json:"folderId"`
 }
 
-// handleRename 修改文件的展示名（前端是双击文件名就地编辑）。
+// handleRename 修改文件的展示名或所属文件夹（前端双击改名 / 拖拽移动）。
 //
 // 权限与删除完全一致（登录 + 本人或管理员），复用 writableFile：
 // 改名和删除一样，都是「动了别人会看见的东西」，不能因为它是轻量操作
 // 就放松 —— 否则任何人都能把共享盘里的文件名改成任意内容。
 //
-// 为什么是 PATCH 而不是 PUT：这是一次局部更新（只改 name 一个字段）。
+// 为什么是 PATCH 而不是 PUT：这是一次局部更新（改 name 或 folderId）。
 func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
-	f, user, ok := s.writableFile(w, r, "重命名")
+	f, user, ok := s.writableFile(w, r, "修改")
 	if !ok {
 		return
 	}
@@ -441,34 +514,97 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, http.StatusBadRequest, "请求内容格式不正确")
 		return
 	}
-
-	// 必须过一遍清洗：名字会被塞进 Content-Disposition 与前端 DOM，
-	// 路径分隔符、控制字符、引号都得在入口处干掉。
-	// 注意 SafeDisplayName 对空串会回退成 "file" —— 空名不报错，
-	// 因为「把名字清空」在语义上等同于「恢复一个兜底的名字」，
-	// 而这种请求几乎只可能来自误操作，给个 file 比报错更省事。
-	name := files.SafeDisplayName(req.Name)
-	if name == f.OriginalName {
-		// 没变化就不写库，省一次 WAL 写入（路由器上的闪光卡寿命有限）。
-		httpx.WriteJSON(w, http.StatusOK, toFileResp(f))
+	if req.Name == nil && req.FolderID == nil {
+		httpx.Fail(w, http.StatusBadRequest, "没有需要修改的内容")
 		return
 	}
 
-	updated, err := s.store.RenameFile(f.ID, name)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			httpx.Fail(w, http.StatusNotFound, "文件不存在")
+	updated := f
+
+	if req.FolderID != nil {
+		if f.Kind != storage.KindPermanent {
+			httpx.Fail(w, http.StatusBadRequest, "只有文件仓库中的文件可以移动到文件夹")
 			return
 		}
-		s.log.Error("重命名文件失败: id=%d err=%v", f.ID, err)
-		httpx.Fail(w, http.StatusInternalServerError, "重命名失败")
-		return
+		targetPtr, ok := s.resolveTargetFolder(w, req.FolderID, "目标文件夹不存在")
+		if !ok {
+			return
+		}
+		if !sameInt64Ptr(updated.FolderID, targetPtr) {
+			next, err := s.store.MoveFile(f.ID, targetPtr)
+			if err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
+					httpx.Fail(w, http.StatusNotFound, "文件不存在")
+					return
+				}
+				s.log.Error("移动文件失败: id=%d folder=%d err=%v", f.ID, derefID(targetPtr), err)
+				httpx.Fail(w, http.StatusInternalServerError, "移动文件失败")
+				return
+			}
+			s.log.Info("文件移动: id=%d name=%q folder=%d user=%s ip=%s",
+				f.ID, updated.OriginalName, derefID(targetPtr), userOrAnon(user), httpx.ClientIP(r))
+			updated = next
+		}
 	}
 
-	s.log.Info("文件重命名: id=%d %q -> %q user=%s ip=%s",
-		f.ID, f.OriginalName, name, userOrAnon(user), httpx.ClientIP(r))
+	if req.Name != nil {
+		// 必须过一遍清洗：名字会被塞进 Content-Disposition 与前端 DOM，
+		// 路径分隔符、控制字符、引号都得在入口处干掉。
+		// 注意 SafeDisplayName 对空串会回退成 "file" —— 空名不报错，
+		// 因为「把名字清空」在语义上等同于「恢复一个兜底的名字」，
+		// 而这种请求几乎只可能来自误操作，给个 file 比报错更省事。
+		name := files.SafeDisplayName(*req.Name)
+		if name != updated.OriginalName {
+			next, err := s.store.RenameFile(f.ID, name)
+			if err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
+					httpx.Fail(w, http.StatusNotFound, "文件不存在")
+					return
+				}
+				s.log.Error("重命名文件失败: id=%d err=%v", f.ID, err)
+				httpx.Fail(w, http.StatusInternalServerError, "重命名失败")
+				return
+			}
+			s.log.Info("文件重命名: id=%d %q -> %q user=%s ip=%s",
+				f.ID, updated.OriginalName, name, userOrAnon(user), httpx.ClientIP(r))
+			updated = next
+		}
+	}
 
 	httpx.WriteJSON(w, http.StatusOK, toFileResp(updated))
+}
+
+func sameInt64Ptr(a, b *int64) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+// checkStorageQuota 检查加上 addBytes 后是否超出文件仓库总容量上限。
+func (s *Server) checkStorageQuota(addBytes int64) error {
+	if s.maxStorage <= 0 {
+		return nil
+	}
+	used, err := s.store.TotalUsage(storage.KindPermanent)
+	if err != nil {
+		return nil
+	}
+	if used >= s.maxStorage {
+		return fmt.Errorf("文件仓库容量已满（上限 %s），请先清理文件", files.HumanSize(s.maxStorage))
+	}
+	if addBytes > 0 && used+addBytes > s.maxStorage {
+		remain := s.maxStorage - used
+		if remain < 0 {
+			remain = 0
+		}
+		return fmt.Errorf("上传后将超过仓库容量上限 %s（剩余可用 %s）",
+			files.HumanSize(s.maxStorage), files.HumanSize(remain))
+	}
+	return nil
 }
 
 // pinReq 是置顶请求体。指针类型让「没传」与「传了 false」区分开。

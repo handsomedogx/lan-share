@@ -34,6 +34,8 @@ type Server struct {
 	// 聊天是即时投递，前端的 XHR 进度条与房间生命周期都不适合超大文件，
 	// 所以给一个更克制的默认值（见 config.ChatMaxUploadBytes）。
 	chatMaxUpload int64
+	// maxStorage 是文件仓库的总容量上限（字节），0 表示不限制。
+	maxStorage int64
 
 	// uploadSem 限制「同时正在落盘」的上传数量。
 	//
@@ -62,6 +64,8 @@ type Options struct {
 	// 却被仓库上限接管」这种违反直觉的行为。
 	// 默认值由 config.Load() 自己负责（当前是 500MB）。
 	ChatMaxUpload int64
+	// MaxStorage 是文件仓库总容量上限（字节），0 表示不限制。
+	MaxStorage int64
 	// UploadConcurrency 是同时允许的上传数，<=0 表示不限。
 	UploadConcurrency int
 }
@@ -78,6 +82,7 @@ func NewServer(o Options) *Server {
 		sessionTTL:    o.SessionTTL,
 		maxUpload:     o.MaxUpload,
 		chatMaxUpload: o.ChatMaxUpload,
+		maxStorage:    o.MaxStorage,
 	}
 	if o.UploadConcurrency > 0 {
 		s.uploadSem = make(chan struct{}, o.UploadConcurrency)
@@ -116,6 +121,12 @@ func (s *Server) Routes() http.Handler {
 	// 置顶切换。用子路径而不是 PATCH 上的字段，是因为它是独立的一次状态翻转，
 	// 语义上不该和「改名」挤在同一个请求体里（两者权限相同、但互不相关）。
 	mux.HandleFunc("POST /api/files/{id}/pin", s.handlePin)
+
+	// ---- 文件夹 ----
+	mux.HandleFunc("GET /api/folders", s.handleListFolders)
+	mux.HandleFunc("POST /api/folders", s.handleCreateFolder)
+	mux.HandleFunc("PATCH /api/folders/{id}", s.handleUpdateFolder)
+	mux.HandleFunc("DELETE /api/folders/{id}", s.handleDeleteFolder)
 
 	// ---- 状态 ----
 	mux.HandleFunc("GET /api/status", s.handleStatus)
@@ -308,6 +319,7 @@ type statusResp struct {
 	PermanentUse     int64     `json:"permanentUse"`
 	MaxUpload        int64     `json:"maxUpload"`
 	ChatMaxUpload    int64     `json:"chatMaxUpload"`
+	MaxStorage       int64     `json:"maxStorage"`
 	User             *userResp `json:"user,omitempty"`
 }
 
@@ -323,6 +335,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		OnlineTotal:   clients,
 		MaxUpload:     s.maxUpload,
 		ChatMaxUpload: s.chatMaxUpload,
+		MaxStorage:    s.maxStorage,
 	}
 
 	if n, err := s.store.CountUsers(); err == nil {

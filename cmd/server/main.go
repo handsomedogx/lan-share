@@ -165,6 +165,7 @@ func run() error {
 		SessionTTL:    cfg.SessionTTL,
 		MaxUpload:     cfg.MaxUploadBytes,
 		ChatMaxUpload: cfg.ChatMaxUploadBytes,
+		MaxStorage:    cfg.MaxStorageBytes,
 
 		UploadConcurrency: cfg.UploadConcurrency,
 	})

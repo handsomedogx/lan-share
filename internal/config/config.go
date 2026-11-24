@@ -59,6 +59,9 @@ type Config struct {
 	// 默认 2 是给路由器定的：同时进行多份「收网络 + 写盘 + SHA256 + fsync」
 	// 会明显抬高负载，而 1～2 路已经能把千兆局域网的磁盘吃满。
 	UploadConcurrency int
+
+	// MaxStorageBytes 是永久文件仓库的总容量上限（字节），0 表示不限制。
+	MaxStorageBytes int64
 }
 
 const (
@@ -86,6 +89,9 @@ const (
 	// 局域网内常见几百兆的安装包或打包文件都可以直接随手传，
 	// 同时仍保留上限避免把即时房间当成无限网盘。
 	DefaultChatMaxUpload int64 = 500 * 1024 * 1024
+
+	// DefaultMaxStorage 是文件仓库默认总容量上限（50 GB）。
+	DefaultMaxStorage int64 = 50 * 1024 * 1024 * 1024
 )
 
 // Load 从环境变量读取配置，未设置的项使用默认值。
@@ -100,6 +106,8 @@ const (
 //	LANSHARE_MAX_UPLOAD_MB  文件仓库单次上传上限（MB），0 或留空表示不限制
 //	LANSHARE_CHAT_UPLOAD_MB 聊天室单文件上限（MB），0 表示聊天室不限制，
 //	                        留空用 DefaultChatMaxUpload（500 MB）
+//	LANSHARE_MAX_STORAGE_GB 文件仓库总容量上限（GB），0 表示不限制，
+//	                        留空用 DefaultMaxStorage（50 GB）
 //
 // 两个上传上限**完全独立**：各自解析、各自生效，互不回落、互不覆盖。
 // 早先的实现会把「未配置」当成「用另一个变量的值」，于是
@@ -120,6 +128,7 @@ func Load() (*Config, error) {
 		SessionTTL:         30 * 24 * 3600,       // 30 天
 		ChatMaxUploadBytes: DefaultChatMaxUpload, // 500 MB
 		UploadConcurrency:  DefaultUploadConcurrency,
+		MaxStorageBytes:    DefaultMaxStorage,    // 50 GB
 	}
 
 	mb := env("LANSHARE_MAX_UPLOAD_MB", "0")
@@ -152,6 +161,18 @@ func Load() (*Config, error) {
 			cfg.ChatMaxUploadBytes = 0 // 显式 0 = 也在聊天室放开限制
 		} else {
 			cfg.ChatMaxUploadBytes = v * 1024 * 1024
+		}
+	}
+
+	if sgb := env("LANSHARE_MAX_STORAGE_GB", ""); sgb != "" {
+		var v int64
+		if _, err := fmt.Sscanf(sgb, "%d", &v); err != nil {
+			return nil, fmt.Errorf("解析 LANSHARE_MAX_STORAGE_GB 失败: %w", err)
+		}
+		if v <= 0 {
+			cfg.MaxStorageBytes = 0
+		} else {
+			cfg.MaxStorageBytes = v * 1024 * 1024 * 1024
 		}
 	}
 

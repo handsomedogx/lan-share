@@ -94,6 +94,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
+CREATE TABLE IF NOT EXISTS folders (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL,
+    parent_id  INTEGER REFERENCES folders(id) ON DELETE CASCADE,
+    owner_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    owner_name TEXT    NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id, name);
+
 CREATE TABLE IF NOT EXISTS files (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     original_name TEXT   NOT NULL,
@@ -113,7 +123,9 @@ CREATE TABLE IF NOT EXISTS files (
     created_at   INTEGER NOT NULL,
     -- 置顶：0 普通，1 置顶。用整数而不是布尔，是因为 SQLite 的布尔本身就是
     -- INTEGER 的别名，直接存 0/1 更省事，也能在 ORDER BY 里直接参与排序。
-    pinned       INTEGER NOT NULL DEFAULT 0
+    pinned       INTEGER NOT NULL DEFAULT 0,
+    -- 所属文件夹 ID（NULL 表示根目录），仅对 permanent 仓库文件有意义。
+    folder_id    INTEGER REFERENCES folders(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_files_kind ON files(kind, created_at DESC);
 -- 注意：idx_files_room 不在这里建。
@@ -225,6 +237,11 @@ CREATE TABLE IF NOT EXISTS settings (
 	// 都建立在「表结构仍含 expires_at」的基础上，顺序颠倒会让它们读到不同的列集。
 	// 拆除后 files 表的列定义与 schema 中的定义完全一致。
 	if err := s.dropExpiresAtColumn(); err != nil {
+		return err
+	}
+
+	// 增量升级：保证 files 表有 folder_id 列及索引。幂等。
+	if err := s.ensureFileFolderColumn(); err != nil {
 		return err
 	}
 
@@ -393,6 +410,25 @@ func (s *Store) ensureFilePinnedColumn() error {
 	if _, err := s.db.Exec(
 		`ALTER TABLE files ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return fmt.Errorf("为文件表添加 pinned 列失败: %w", err)
+	}
+	return nil
+}
+
+// ensureFileFolderColumn 保证 files 表有 folder_id 列及索引。幂等。
+func (s *Store) ensureFileFolderColumn() error {
+	has, err := s.columnExists("files", "folder_id")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := s.db.Exec(
+			`ALTER TABLE files ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL`); err != nil {
+			return fmt.Errorf("为文件表添加 folder_id 列失败: %w", err)
+		}
+	}
+	if _, err := s.db.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder_id)`); err != nil {
+		return fmt.Errorf("为文件表创建目录索引失败: %w", err)
 	}
 	return nil
 }
@@ -713,6 +749,8 @@ type File struct {
 	// 只有永久文件会用到它：置顶解决的是「常用的那几个文件每次都要往下翻」，
 	// 而聊天文件本身就是短命的，置顶没有意义（接口层也只能操作永久文件）。
 	Pinned bool
+	// FolderID 表示该文件所属的文件夹 ID，nil 表示位于仓库根目录。
+	FolderID *int64
 }
 
 // CreateFile 写入文件元数据。
@@ -721,12 +759,13 @@ func (s *Store) CreateFile(f *File) (int64, error) {
 	if f.OwnerID != nil {
 		owner = *f.OwnerID
 	}
+	folder := nullableID(f.FolderID)
 
 	res, err := s.db.Exec(`
-		INSERT INTO files (original_name, stored_name, size, sha256, kind, owner_id, owner_name, room_code, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO files (original_name, stored_name, size, sha256, kind, owner_id, owner_name, room_code, created_at, folder_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		f.OriginalName, f.StoredName, f.Size, f.SHA256, string(f.Kind),
-		owner, f.OwnerName, f.RoomCode, f.CreatedAt.Unix(),
+		owner, f.OwnerName, f.RoomCode, f.CreatedAt.Unix(), folder,
 	)
 	if err != nil {
 		return 0, err
@@ -734,7 +773,7 @@ func (s *Store) CreateFile(f *File) (int64, error) {
 	return res.LastInsertId()
 }
 
-const fileCols = `id, original_name, stored_name, size, sha256, kind, owner_id, owner_name, room_code, created_at, pinned`
+const fileCols = `id, original_name, stored_name, size, sha256, kind, owner_id, owner_name, room_code, created_at, pinned, folder_id`
 
 func scanFile(sc interface{ Scan(...any) error }) (*File, error) {
 	var f File
@@ -742,9 +781,10 @@ func scanFile(sc interface{ Scan(...any) error }) (*File, error) {
 	var owner sql.NullInt64
 	var created int64
 	var pinned int64
+	var folder sql.NullInt64
 
 	if err := sc.Scan(&f.ID, &f.OriginalName, &f.StoredName, &f.Size, &f.SHA256,
-		&kind, &owner, &f.OwnerName, &f.RoomCode, &created, &pinned); err != nil {
+		&kind, &owner, &f.OwnerName, &f.RoomCode, &created, &pinned, &folder); err != nil {
 		return nil, err
 	}
 	f.Kind = FileKind(kind)
@@ -754,6 +794,10 @@ func scanFile(sc interface{ Scan(...any) error }) (*File, error) {
 	}
 	f.CreatedAt = time.Unix(created, 0)
 	f.Pinned = pinned != 0
+	if folder.Valid && folder.Int64 > 0 {
+		v := folder.Int64
+		f.FolderID = &v
+	}
 	return &f, nil
 }
 
@@ -974,4 +1018,247 @@ func (s *Store) TotalUsage(kind FileKind) (int64, error) {
 	var n sql.NullInt64
 	err := s.db.QueryRow(`SELECT SUM(size) FROM files WHERE kind = ?`, string(kind)).Scan(&n)
 	return n.Int64, err
+}
+
+// MoveFile 修改文件所属文件夹，folderID 为 nil 或 <=0 表示移回根目录。
+func (s *Store) MoveFile(id int64, folderID *int64) (*File, error) {
+	if _, err := s.db.Exec(
+		`UPDATE files SET folder_id = ? WHERE id = ?`, nullableID(folderID), id); err != nil {
+		return nil, err
+	}
+	return s.FileByID(id)
+}
+
+// ---------------------------------------------------------------- 文件夹
+
+var (
+	// ErrFolderExists 表示同一目录下已存在同名文件夹。
+	ErrFolderExists = errors.New("同级目录下已存在同名文件夹")
+	// ErrFolderCycle 表示尝试将文件夹移动到自身或其子文件夹下。
+	ErrFolderCycle = errors.New("不能将文件夹移动到自身或其子文件夹内")
+)
+
+// Folder 是文件仓库的虚拟目录节点（仅用于前端组织展示，物理文件仍按内容散列平铺存储）。
+type Folder struct {
+	ID        int64
+	Name      string
+	ParentID  *int64
+	OwnerID   *int64
+	OwnerName string
+	CreatedAt time.Time
+}
+
+const folderCols = `id, name, parent_id, owner_id, owner_name, created_at`
+
+func nullableID(p *int64) any {
+	if p == nil || *p <= 0 {
+		return nil
+	}
+	return *p
+}
+
+func scanFolder(sc interface{ Scan(...any) error }) (*Folder, error) {
+	var f Folder
+	var parent, owner sql.NullInt64
+	var created int64
+	if err := sc.Scan(&f.ID, &f.Name, &parent, &owner, &f.OwnerName, &created); err != nil {
+		return nil, err
+	}
+	if parent.Valid && parent.Int64 > 0 {
+		v := parent.Int64
+		f.ParentID = &v
+	}
+	if owner.Valid && owner.Int64 > 0 {
+		v := owner.Int64
+		f.OwnerID = &v
+	}
+	f.CreatedAt = time.Unix(created, 0)
+	return &f, nil
+}
+
+func (s *Store) folderSiblingExists(q interface {
+	QueryRow(string, ...any) *sql.Row
+}, name string, parentID *int64, excludeID int64) (bool, error) {
+	var dummy int
+	err := q.QueryRow(
+		`SELECT 1 FROM folders
+		 WHERE parent_id IS ? AND name = ? COLLATE NOCASE AND id != ?
+		 LIMIT 1`,
+		nullableID(parentID), name, excludeID,
+	).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// CreateFolder 创建文件夹，同级目录下重名（不区分大小写）返回 ErrFolderExists。
+func (s *Store) CreateFolder(f *Folder) (int64, error) {
+	dup, err := s.folderSiblingExists(s.db, f.Name, f.ParentID, 0)
+	if err != nil {
+		return 0, err
+	}
+	if dup {
+		return 0, ErrFolderExists
+	}
+
+	created := f.CreatedAt
+	if created.IsZero() {
+		created = time.Now()
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO folders (name, parent_id, owner_id, owner_name, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		f.Name, nullableID(f.ParentID), nullableID(f.OwnerID), f.OwnerName, created.Unix(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// FolderByID 按 ID 查询文件夹，不存在返回 ErrNotFound。
+func (s *Store) FolderByID(id int64) (*Folder, error) {
+	row := s.db.QueryRow(`SELECT `+folderCols+` FROM folders WHERE id = ?`, id)
+	f, err := scanFolder(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return f, nil
+}
+
+// ListFolders 按名称排序返回全部文件夹。
+func (s *Store) ListFolders() ([]*Folder, error) {
+	rows, err := s.db.Query(
+		`SELECT ` + folderCols + ` FROM folders ORDER BY name COLLATE NOCASE ASC, id ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*Folder, 0, 16)
+	for rows.Next() {
+		f, err := scanFolder(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// RenameFolder 修改文件夹名称，同级重名返回 ErrFolderExists。
+func (s *Store) RenameFolder(id int64, name string) (*Folder, error) {
+	cur, err := s.FolderByID(id)
+	if err != nil {
+		return nil, err
+	}
+	dup, err := s.folderSiblingExists(s.db, name, cur.ParentID, id)
+	if err != nil {
+		return nil, err
+	}
+	if dup {
+		return nil, ErrFolderExists
+	}
+	if _, err := s.db.Exec(`UPDATE folders SET name = ? WHERE id = ?`, name, id); err != nil {
+		return nil, err
+	}
+	return s.FolderByID(id)
+}
+
+// MoveFolder 移动文件夹到新的父目录（parentID 为 nil 或 <=0 表示根目录），并防止形成环。
+func (s *Store) MoveFolder(id int64, parentID *int64) (*Folder, error) {
+	cur, err := s.FolderByID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	if parentID != nil && *parentID > 0 {
+		if *parentID == id {
+			return nil, ErrFolderCycle
+		}
+		// 从目标父目录一路向上回溯到根，确保不会把自己移进后代目录。
+		cursor := *parentID
+		seen := make(map[int64]struct{})
+		for cursor > 0 {
+			if cursor == id {
+				return nil, ErrFolderCycle
+			}
+			if _, ok := seen[cursor]; ok {
+				return nil, ErrFolderCycle
+			}
+			seen[cursor] = struct{}{}
+			anc, err := s.FolderByID(cursor)
+			if err != nil {
+				return nil, err
+			}
+			if anc.ParentID == nil {
+				break
+			}
+			cursor = *anc.ParentID
+		}
+	}
+
+	dup, err := s.folderSiblingExists(s.db, cur.Name, parentID, id)
+	if err != nil {
+		return nil, err
+	}
+	if dup {
+		return nil, ErrFolderExists
+	}
+
+	if _, err := s.db.Exec(`UPDATE folders SET parent_id = ? WHERE id = ?`, nullableID(parentID), id); err != nil {
+		return nil, err
+	}
+	return s.FolderByID(id)
+}
+
+// DeleteFolderAndUnwrap 删除文件夹，并将其直接子文件与子文件夹上移到其父目录（默认根目录）。
+func (s *Store) DeleteFolderAndUnwrap(id int64) (movedFiles, movedFolders int64, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var parent sql.NullInt64
+	if err := tx.QueryRow(`SELECT parent_id FROM folders WHERE id = ?`, id).Scan(&parent); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, 0, ErrNotFound
+		}
+		return 0, 0, err
+	}
+
+	var parentVal any
+	if parent.Valid && parent.Int64 > 0 {
+		parentVal = parent.Int64
+	}
+
+	resFiles, err := tx.Exec(`UPDATE files SET folder_id = ? WHERE folder_id = ?`, parentVal, id)
+	if err != nil {
+		return 0, 0, err
+	}
+	movedFiles, _ = resFiles.RowsAffected()
+
+	resFolders, err := tx.Exec(`UPDATE folders SET parent_id = ? WHERE parent_id = ?`, parentVal, id)
+	if err != nil {
+		return 0, 0, err
+	}
+	movedFolders, _ = resFolders.RowsAffected()
+
+	if _, err := tx.Exec(`DELETE FROM folders WHERE id = ?`, id); err != nil {
+		return 0, 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return movedFiles, movedFolders, nil
 }
