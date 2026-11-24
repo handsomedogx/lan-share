@@ -306,6 +306,8 @@ type statusResp struct {
 	OnlineTotal      int       `json:"onlineTotal"`
 	PermanentNum     int       `json:"permanentNum"`
 	PermanentUse     int64     `json:"permanentUse"`
+	MaxUpload        int64     `json:"maxUpload"`
+	ChatMaxUpload    int64     `json:"chatMaxUpload"`
 	User             *userResp `json:"user,omitempty"`
 }
 
@@ -314,11 +316,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	rooms, clients := s.sessions.Stats()
 
 	resp := statusResp{
-		Product:     "LAN Share",
-		Version:     Version,
-		LoggedIn:    u != nil,
-		Rooms:       rooms,
-		OnlineTotal: clients,
+		Product:       "LAN Share",
+		Version:       Version,
+		LoggedIn:      u != nil,
+		Rooms:         rooms,
+		OnlineTotal:   clients,
+		MaxUpload:     s.maxUpload,
+		ChatMaxUpload: s.chatMaxUpload,
 	}
 
 	if n, err := s.store.CountUsers(); err == nil {

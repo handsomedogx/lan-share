@@ -636,8 +636,9 @@ button, input, textarea { font: inherit; color: inherit; }
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
 }
 
-.composer-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.composer-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
 .composer-btns { display: flex; align-items: center; gap: 8px; }
+.limit-hint { font-size: 12px; color: var(--text-3); white-space: nowrap; }
 
 /* 待发送的粘贴图片。
    缩略图固定 56px 见方 + object-fit: cover —— 截图分辨率五花八门，
@@ -903,7 +904,8 @@ button, input, textarea { font: inherit; color: inherit; }
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 6px 10px;
   padding: 8px 16px;
   font-size: 12px;
   color: var(--text-2);
@@ -911,6 +913,7 @@ button, input, textarea { font: inherit; color: inherit; }
   background: var(--surface-2);
 }
 .usage-hint { color: var(--text-3); }
+.usage-limit { margin-left: auto; color: var(--text-3); white-space: nowrap; }
 
 /* 上传进度 */
 .upload-list {

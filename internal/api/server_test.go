@@ -930,3 +930,32 @@ func (e *testEnv) fileSizeByName(t *testing.T, name string) int64 {
 	t.Fatalf("没有找到名为 %q 的记录", name)
 	return 0
 }
+
+// TestStatusIncludesUploadLimits 验证 /api/status 会把文件仓库与聊天室的单文件上限返回给前端。
+func TestStatusIncludesUploadLimits(t *testing.T) {
+	const repoLimit = 512 * 1024 * 1024
+	const chatLimit = 100 * 1024 * 1024
+	env := newTestEnv(t, repoLimit, chatLimit)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	w := httptest.NewRecorder()
+	env.srv.Routes().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /api/status 状态码 = %d, 期望 200", w.Code)
+	}
+
+	var got struct {
+		MaxUpload     int64 `json:"maxUpload"`
+		ChatMaxUpload int64 `json:"chatMaxUpload"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解析 /api/status JSON 失败: %v", err)
+	}
+	if got.MaxUpload != repoLimit {
+		t.Errorf("maxUpload = %d, 期望 %d", got.MaxUpload, repoLimit)
+	}
+	if got.ChatMaxUpload != chatLimit {
+		t.Errorf("chatMaxUpload = %d, 期望 %d", got.ChatMaxUpload, chatLimit)
+	}
+}

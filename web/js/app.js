@@ -457,6 +457,45 @@ function renderSetup() {
 
   // needSetup 会决定提示条显不显示，所以状态刷新后要重算一次。
   renderLock();
+  renderUploadLimits();
+}
+
+/** 格式化单文件大小限制文案：0 或负数表示不限。 */
+function formatLimitText(bytes) {
+  const n = Number(bytes) || 0;
+  return n > 0 ? ('单文件 ≤ ' + humanSize(n)) : '单文件不限';
+}
+
+/** 展示房间与文件仓库的单文件上传大小限制。 */
+function renderUploadLimits() {
+  const st = state.status;
+  if (!st) return;
+
+  if (typeof st.chatMaxUpload === 'number') {
+    const chatText = formatLimitText(st.chatMaxUpload);
+    const chatEl = $('#chatLimitHint');
+    if (chatEl) {
+      setText(chatEl, chatText);
+      chatEl.hidden = false;
+    }
+    const btnChatFile = $('#btnChatFile');
+    if (btnChatFile) {
+      btnChatFile.title = '发送文件（' + chatText + '，也可以直接把文件拖进左侧面板）';
+    }
+  }
+
+  if (typeof st.maxUpload === 'number') {
+    const fileText = formatLimitText(st.maxUpload);
+    const fileEl = $('#fileLimitHint');
+    if (fileEl) {
+      setText(fileEl, fileText);
+      fileEl.hidden = false;
+    }
+    const btnUpload = $('#btnUpload');
+    if (btnUpload) {
+      btnUpload.title = '上传文件（' + fileText + '）';
+    }
+  }
 }
 
 /** 刷新运行状态（版本、用量、注册开关）。 */
